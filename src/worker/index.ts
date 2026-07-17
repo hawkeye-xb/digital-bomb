@@ -32,6 +32,7 @@ export default {
       const objectId = env.ROOMS.idFromName(roomCode);
       const room = env.ROOMS.get(objectId);
       const doUrl = new URL(`https://do${roomMatch[2] || ""}`);
+      doUrl.search = url.search;
       const doRequest = new Request(doUrl, { method, headers: request.headers, body: method !== "GET" ? request.body : undefined });
       return room.fetch(doRequest);
     }
