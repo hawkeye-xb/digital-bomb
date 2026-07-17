@@ -24,9 +24,9 @@ export class Room extends DurableObject<RoomEnv> {
     const path = url.pathname;
     await this.load();
 
-    // WebSocket: path 以 /socket 结尾（Upgrade header 被 CF 剥离，不检查）
-    if (path.endsWith("/socket")) {
-      return this.handleWsUpgrade(request);
+    // 调试：看 DO 收到什么 path
+    if (path.startsWith("/api/rooms/") && path.endsWith("/socket")) {
+      return new Response(`DEBUG: path=${path} url=${request.url}`, { status: 200 });
     }
 
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
