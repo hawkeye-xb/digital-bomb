@@ -59,41 +59,22 @@ async function handleWebSocket(request: Request, env: Env, roomCode: string): Pr
   if (!secret) return new Response("no secret", { status: 500 });
   const claims = await verifyTicket(secret, ticket);
   if (!claims || claims.roomCode !== roomCode)
-    return new Response(`invalid ticket. claims_room=${claims?.roomCode} vs ${roomCode}`, { status: 401 });
+    return new Response(`invalid ticket`, { status: 401 });
 
-  // Create WebSocket pair
+  // Create WebSocket pair (just create and see if it works)
   const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+  const [client, server] = Object.values(pair) as unknown as [WebSocket, WebSocket];
 
   server.accept();
-  connections.set(server, { ws: server, playerId: claims.playerId, roomCode });
 
-  // Set up message handler
-  server.addEventListener("message", async (event: Event) => {
-    try {
-      const msg = JSON.parse((event as MessageEvent).data as string);
-      await handleWsMsg(server, msg, env);
-    } catch (e) { console.error(e); }
+  server.addEventListener("message", async (event) => {
+    const data = JSON.parse((event as MessageEvent).data as string);
+    server.send(JSON.stringify({ echo: data }));
   });
 
-  server.addEventListener("close", () => {
-    connections.delete(server);
-  });
+  server.addEventListener("close", () => { /* noop */ });
 
-  // Compute WebSocket accept key
-  const wsKey = request.headers.get("Sec-WebSocket-Key") || "";
-  const acceptInput = wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-  const hash = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(acceptInput));
-  const acceptKey = btoa(String.fromCharCode(...new Uint8Array(hash)));
-
-  return new Response(null, {
-    status: 101,
-    headers: {
-      "Upgrade": "websocket",
-      "Connection": "Upgrade",
-      "Sec-WebSocket-Accept": acceptKey,
-    },
-  });
+  return new Response(null, { status: 101, webSocket: client });
 }
 
 async function handleWsMsg(ws: WebSocket, raw: { type: string; commandId: string; expectedVersion: number; payload: unknown }, env: Env) {
