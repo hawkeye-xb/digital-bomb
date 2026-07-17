@@ -4,6 +4,7 @@ import React, { useState, useCallback, useEffect, useRef } from "react";
 import type {
   InteractionKind,
   PlayerActivity,
+  PublicCause,
   PublicRoomView,
   PublicPlayer,
   PublicGame,
@@ -91,7 +92,12 @@ export default function App() {
       saveStorage("_lastName", "", name);
 
       const t = new GameTransport(location.origin, data.roomCode, data.playerToken, {
-        onState: (s) => setState((prev) => ({ ...prev, roomState: s, phase: "in-room" })),
+        onState: (s, cause) => setState((prev) => ({
+          ...prev,
+          roomState: s,
+          phase: "in-room",
+          notice: noticeForCause(s, cause) ?? prev.notice,
+        })),
         onPresence: (message) => setState((prev) => ({
           ...prev,
           roomState: prev.roomState ? {
@@ -164,7 +170,12 @@ export default function App() {
       saveStorage("_lastName", "", name);
 
       const t = new GameTransport(location.origin, code, finalToken, {
-        onState: (s) => setState((prev) => ({ ...prev, roomState: s, phase: "in-room" })),
+        onState: (s, cause) => setState((prev) => ({
+          ...prev,
+          roomState: s,
+          phase: "in-room",
+          notice: noticeForCause(s, cause) ?? prev.notice,
+        })),
         onPresence: (message) => setState((prev) => ({
           ...prev,
           roomState: prev.roomState ? {
@@ -297,6 +308,17 @@ function interactionText(name: string | undefined, interaction: InteractionKind)
     case "nice": return `${who}：这把猜得漂亮 👏`;
     case "rematch": return `${who}：不服，再来一局！🔥`;
   }
+}
+
+function noticeForCause(state: PublicRoomView, cause?: PublicCause): string | null {
+  if (cause?.type !== "guess.resolved" || cause.playerId === state.viewerPlayerId) return null;
+  const name = state.players.find((player) => player.id === cause.playerId)?.name || "对方";
+  const message = `${name} 猜了 ${cause.guess}：${hitsText(cause.hits)}`;
+  if (typeof navigator !== "undefined" && "vibrate" in navigator) navigator.vibrate(80);
+  if (typeof document !== "undefined" && document.hidden && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    new Notification("数字炸弹", { body: message });
+  }
+  return message;
 }
 
 // ─── 首页 ───
@@ -457,12 +479,18 @@ function RoomScreen({
   // 根据阶段渲染不同界面
   const phase = roomState.phase;
 
-  const shareRoom = () => {
+  const shareRoom = async () => {
     const url = `${location.origin}/r/${roomState.roomCode}`;
-    navigator.clipboard.writeText(url).catch(() => {});
     if (navigator.share) {
-      navigator.share({ title: "数字炸弹", text: `来玩数字炸弹！房间码: ${roomState.roomCode}`, url });
+      try {
+        await navigator.share({ title: "数字炸弹", text: `来玩数字炸弹！房间码: ${roomState.roomCode}`, url });
+        return;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+      }
     }
+    await navigator.clipboard.writeText(url).catch(() => {});
+    showToast("邀请链接已复制");
   };
 
   return (
@@ -697,12 +725,21 @@ function PlayingPhase({
 }) {
   const [guessInput, setGuessInput] = useState("");
   const [showMySecret, setShowMySecret] = useState(false);
+  const guessInputRef = useRef<HTMLInputElement | null>(null);
   const isMyTurn = game.currentPlayerId === playerId;
   const turnStartedAt = game.turns.at(-1)?.createdAt ?? game.startedAt;
   const elapsed = useElapsedSeconds(turnStartedAt);
 
   useEffect(() => {
     sendPresence(isMyTurn ? "thinking" : "idle");
+    if (isMyTurn) {
+      setGuessInput("");
+      const frame = requestAnimationFrame(() => guessInputRef.current?.focus());
+      return () => {
+        cancelAnimationFrame(frame);
+        sendPresence("idle");
+      };
+    }
     return () => sendPresence("idle");
   }, [isMyTurn, sendPresence]);
 
@@ -765,8 +802,12 @@ function PlayingPhase({
       {isMyTurn && (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, width: "100%", maxWidth: 300, margin: "0 auto" }}>
           <input
+            key={`${game.gameNumber}-${game.turns.length}`}
+            ref={guessInputRef}
             type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4}
             value={guessInput} onChange={(e) => handleGuessChange(e.target.value)}
+            onFocus={() => sendPresence(guessInput ? "typing" : "thinking")}
+            onBlur={() => sendPresence("idle")}
             placeholder="输入 4 位数字" autoFocus
             className="digit-input"
           />
@@ -777,11 +818,11 @@ function PlayingPhase({
       )}
 
       {/* 双方历史 */}
-      {rounds.length > 0 && (
-        <div style={{ maxHeight: 200, overflow: "auto", marginTop: 4 }}>
+      <div className="history-panel">
+        {rounds.length > 0 ? (
           <div className="turn-history">
-            {rounds.map((round, ri) => (
-              <div key={ri} className="round-group">
+            {[...rounds].reverse().map((round) => (
+              <div key={round.ro} className="round-group">
                 <div className="round-label">第 {round.ro} 轮</div>
                 {round.turns.map((t) => {
                   const p = t.playerId === me?.id ? me : opponent;
@@ -796,8 +837,10 @@ function PlayingPhase({
               </div>
             ))}
           </div>
-        </div>
-      )}
+        ) : (
+          <div className="history-empty">第一条猜测会出现在这里</div>
+        )}
+      </div>
     </div>
   );
 }

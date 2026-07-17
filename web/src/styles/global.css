@@ -239,6 +239,25 @@ input {
   gap: 8px;
 }
 
+.history-panel {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-top: 4px;
+  padding-bottom: 8px;
+}
+
+.history-empty {
+  height: 100%;
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
 .round-group {
   border-left: 2px solid var(--border);
   padding-left: 12px;
