@@ -10,6 +10,7 @@ import type {
   PublicGame,
 } from "../../../src/shared/domain.js";
 import { GameTransport, type ConnectionState } from "../transport/websocket.js";
+import { track, trackRoomOp } from "../utils/analytics.js";
 
 const API = "/api";
 
@@ -90,6 +91,7 @@ export default function App() {
     if (createInFlightRef.current) return;
     createInFlightRef.current = true;
     setState((s) => ({ ...s, phase: "creating", error: null }));
+    const startTime = Date.now();
     try {
       const resp = await fetch(`${API}/rooms`, {
         method: "POST",
@@ -106,10 +108,12 @@ export default function App() {
       };
 
       if (data.error) {
+        trackRoomOp("create", Date.now() - startTime, false);
         setState((s) => ({ ...s, error: data.error!.message, phase: "home" }));
         return;
       }
 
+      trackRoomOp("create", Date.now() - startTime, true);
       saveStorage(data.roomCode, data.playerToken, name);
       saveStorage("_lastName", "", name);
       history.replaceState(null, "", `/r/${data.roomCode}`);
@@ -154,6 +158,7 @@ export default function App() {
 
       await t.connect();
     } catch (err) {
+      trackRoomOp("create", Date.now() - startTime, false);
       setState((s) => ({
         ...s,
         error: "创建房间失败，请重试",
@@ -178,6 +183,7 @@ export default function App() {
 
     const storage = loadStorage();
     const saved = storage[code];
+    const startTime = Date.now();
 
     try {
       const resp = await fetch(`${API}/rooms/${code}/join`, {
@@ -196,6 +202,7 @@ export default function App() {
       };
 
       if (data.error) {
+        trackRoomOp("join", Date.now() - startTime, false);
         setState((s) => ({
           ...s,
           error: data.error!.message,
@@ -205,6 +212,7 @@ export default function App() {
       }
 
       const finalToken = saved?.token || data.playerToken;
+      trackRoomOp("join", Date.now() - startTime, true);
       saveStorage(code, finalToken, normalizedName);
       saveStorage("_lastName", "", normalizedName);
       history.replaceState(null, "", `/r/${code}`);
@@ -249,6 +257,7 @@ export default function App() {
 
       await t.connect();
     } catch {
+      trackRoomOp("join", Date.now() - startTime, false);
       setState((s) => ({
         ...s,
         error: "加入失败，请检查房间码或网络",
@@ -298,6 +307,21 @@ export default function App() {
   }, []);
 
   // ─── 从 URL 检测房间码 ───
+
+  // 页面加载埋点（仅首次）
+  useEffect(() => {
+    try {
+      const nav = typeof performance !== "undefined"
+        ? performance.getEntriesByType?.("navigation")?.[0] as PerformanceNavigationTiming | undefined
+        : undefined;
+      const conn = (navigator as any).connection;
+      track("digital_bomb_page_loaded", {
+        dom_content_loaded_ms: nav?.domContentLoadedEventEnd ?? 0,
+        rtt_ms: conn?.rtt ?? 0,
+        effective_type: conn?.effectiveType ?? "unknown",
+      });
+    } catch { /* SSR / test env */ }
+  }, []);
 
   useEffect(() => {
     const inviteCode = inviteCodeFromPath();

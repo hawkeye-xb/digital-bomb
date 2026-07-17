@@ -10,6 +10,7 @@ import type {
   PublicCause,
   PublicRoomView,
 } from "../../../src/shared/domain.js";
+import { trackCommandLatency, trackReconnect, trackWsConnect } from "../utils/analytics.js";
 
 export type ConnectionState = "connecting" | "connected" | "reconnecting";
 
@@ -40,6 +41,9 @@ export class GameTransport {
   private inFlightCommandId: string | null = null;
   private hiddenAt: number | null = null;
   private lifecycleInstalled = false;
+  private commandSentAt = new Map<string, number>();
+  private reconnectCount = 0;
+  private wsStartTime = 0;
 
   constructor(
     private readonly baseUrl: string,
@@ -96,6 +100,7 @@ export class GameTransport {
 
   private async openSocket(): Promise<void> {
     this.handler.onConnection(this.lastVersion < 0 ? "connecting" : "reconnecting");
+    this.wsStartTime = Date.now();
     let socket: WebSocket | null = null;
     try {
       const ticket = await this.getTicket();
@@ -135,6 +140,8 @@ export class GameTransport {
 
       if (this.stopped || socket !== this.socket) return;
       this.retryDelay = 1_000;
+      const connectDuration = Date.now() - this.wsStartTime;
+      trackWsConnect(connectDuration, this.lastVersion >= 0);
       this.handler.onConnection("connected");
       if (!this.awaitingSnapshot) this.pumpCommands();
     } catch {
@@ -170,6 +177,7 @@ export class GameTransport {
         break;
       case "command.ack":
         this.lastVersion = Math.max(this.lastVersion, message.version);
+        this.trackLatencyIfExists(message.commandId);
         this.pendingCommands = this.pendingCommands.filter(
           (command) => command.commandId !== message.commandId,
         );
@@ -214,6 +222,7 @@ export class GameTransport {
     if (!command) return;
     if (this.lastVersion >= 0) command.expectedVersion = this.lastVersion;
     this.inFlightCommandId = command.commandId;
+    this.commandSentAt.set(command.commandId, Date.now());
     this.socket.send(JSON.stringify(command));
     this.clearAckTimer();
     this.ackTimer = setTimeout(() => this.forceReconnect(), COMMAND_ACK_TIMEOUT_MS);
@@ -225,6 +234,7 @@ export class GameTransport {
     this.awaitingSnapshot = true;
     this.inFlightCommandId = null;
     this.clearAckTimer();
+    this.commandSentAt.clear();
     if (!this.stopped) this.scheduleRetry();
   }
 
@@ -245,6 +255,8 @@ export class GameTransport {
   private scheduleRetry(immediate = false): void {
     if (this.retryTimer || this.stopped) return;
     this.handler.onConnection("reconnecting");
+    this.reconnectCount++;
+    trackReconnect(this.reconnectCount);
     const delay = immediate ? 0 : this.retryDelay + Math.floor(Math.random() * 300);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
@@ -262,6 +274,17 @@ export class GameTransport {
   private clearAckTimer(): void {
     if (this.ackTimer) clearTimeout(this.ackTimer);
     this.ackTimer = null;
+  }
+
+  private trackLatencyIfExists(commandId: string): void {
+    const sentAt = this.commandSentAt.get(commandId);
+    if (sentAt === undefined) return;
+    this.commandSentAt.delete(commandId);
+    const latency = Date.now() - sentAt;
+    // 找到对应的命令类型
+    const cmd = this.pendingCommands.find((c) => c.commandId === commandId) ??
+      (this.inFlightCommandId === commandId ? { type: "unknown" } as PendingCommand : null);
+    trackCommandLatency(cmd?.type ?? "unknown", latency);
   }
 
   private installLifecycleRecovery(): void {
