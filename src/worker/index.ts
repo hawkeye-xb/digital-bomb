@@ -53,28 +53,13 @@ export default {
 };
 
 async function handleWebSocket(request: Request, env: Env, roomCode: string): Promise<Response> {
-  // Verify ticket
   const ticket = new URL(request.url).searchParams.get("ticket") || "";
   const secret = env.WS_TICKET_SECRET;
   if (!secret) return new Response("no secret", { status: 500 });
   const claims = await verifyTicket(secret, ticket);
   if (!claims || claims.roomCode !== roomCode)
-    return new Response(`invalid ticket`, { status: 401 });
-
-  // Create WebSocket pair (just create and see if it works)
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair) as unknown as [WebSocket, WebSocket];
-
-  server.accept();
-
-  server.addEventListener("message", async (event) => {
-    const data = JSON.parse((event as MessageEvent).data as string);
-    server.send(JSON.stringify({ echo: data }));
-  });
-
-  server.addEventListener("close", () => { /* noop */ });
-
-  return new Response(null, { status: 101, webSocket: client });
+    return new Response("invalid ticket", { status: 401 });
+  return new Response(`ok player=${claims.playerId}`, { status: 200 });
 }
 
 async function handleWsMsg(ws: WebSocket, raw: { type: string; commandId: string; expectedVersion: number; payload: unknown }, env: Env) {
