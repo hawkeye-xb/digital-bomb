@@ -78,7 +78,8 @@ async function handleWebSocket(request: Request, env: Env, roomCode: string): Pr
   const ticket = url.searchParams.get("ticket") || "";
 
   // 验证 ticket
-  const secret = env.WS_TICKET_SECRET || "dev-secret";
+  const secret = env.WS_TICKET_SECRET;
+  if (!secret) return new Response("missing WS_TICKET_SECRET", { status: 500 });
   const claims = await verifyTicket(secret, ticket);
   if (!claims || claims.roomCode !== roomCode) {
     return new Response("ticket 无效或已过期", { status: 401 });

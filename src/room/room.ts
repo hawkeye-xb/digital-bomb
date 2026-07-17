@@ -155,7 +155,8 @@ export class Room extends DurableObject<RoomEnv> {
     if (!player) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
 
     const { signTicket } = await import("../worker/auth.js");
-    const secret = this.env.WS_TICKET_SECRET || "dev-secret";
+    const secret = this.env.WS_TICKET_SECRET;
+    if (!secret) return this.errorRes("INTERNAL_ERROR", "missing secret", 500);
     const claims = {
       roomCode: this.state.roomCode,
       playerId: player.id,
