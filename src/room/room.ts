@@ -24,10 +24,11 @@ export class Room extends DurableObject<RoomEnv> {
     const path = url.pathname;
     await this.load();
 
-    // WebSocket: path 以 /socket 结尾
-    // Worker 自己处理 WebSocket，DO 只做 HTTP API
-    if (path.endsWith("/socket")) {
-      return new Response("use wss via Worker", { status: 400 });
+    // WebSocket: path 以 /socket 结尾 或 Upgrade header
+    const isWs = path.endsWith("/socket");
+    const upgrade = request.headers.get("Upgrade");
+    if (isWs && upgrade === "websocket") {
+      return this.handleWsUpgrade(request);
     }
 
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);

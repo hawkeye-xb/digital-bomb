@@ -26,10 +26,14 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // WebSocket: /api/rooms/{code}/socket — Worker handles directly
+    // WebSocket: /api/rooms/{code}/socket — 转发原始 request 给 DO 处理
+    // ⚠️ 不创建 new Request（会丢 Upgrade header）
     const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
     if (wsMatch) {
-      return handleWebSocket(request, env, wsMatch[1]!);
+      const roomCode = wsMatch[1]!;
+      const objectId = env.ROOMS.idFromName(roomCode);
+      const room = env.ROOMS.get(objectId);
+      return room.fetch(request);
     }
 
     if (path === "/api/rooms" && method === "POST") {
