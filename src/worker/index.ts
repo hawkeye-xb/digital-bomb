@@ -1,12 +1,10 @@
-// ─── Cloudflare Worker — Worker handles WebSocket, DO is state store ───
+// ─── Cloudflare Worker — 纯路由，DO 处理一切 ───
 
 import { Room } from "../room/room.js";
 import { errorResponse, jsonResponse } from "./responses.js";
 import { isValidName } from "../shared/validation.js";
 import { generateRoomCode } from "../room/engine.js";
-import { generatePlayerToken, hashToken, verifyTicket } from "./auth.js";
-import type { RoomState, PublicCause } from "../shared/domain.js";
-import type { ServerMessage, CommandError } from "../shared/protocol.js";
+import { generatePlayerToken, hashToken } from "./auth.js";
 
 export { Room };
 
@@ -16,23 +14,16 @@ interface Env {
   ASSETS?: { fetch: (req: Request) => Promise<Response> };
 }
 
-// Per-worker WebSocket connections
-type Conn = { ws: WebSocket; playerId: string; roomCode: string };
-const connections = new Map<WebSocket, Conn>();
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
 
-    // WebSocket: /api/rooms/{code}/socket — 转发原始 request 给 DO 处理
-    // ⚠️ 不创建 new Request（会丢 Upgrade header）
+    // WebSocket: 转发原始 request 给 DO
     const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
     if (wsMatch) {
-      const roomCode = wsMatch[1]!;
-      const objectId = env.ROOMS.idFromName(roomCode);
-      const room = env.ROOMS.get(objectId);
+      const room = env.ROOMS.get(env.ROOMS.idFromName(wsMatch[1]!));
       return room.fetch(request);
     }
 
@@ -43,11 +34,11 @@ export default {
     // Other API → forward to DO
     const roomMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})(\/.*)?$/);
     if (roomMatch) {
-      const roomCode = roomMatch[1]!;
       const doUrl = new URL(`https://do${roomMatch[2] || ""}`);
       doUrl.search = url.search;
-      const obj = env.ROOMS.get(env.ROOMS.idFromName(roomCode));
-      return obj.fetch(new Request(doUrl, { method, headers: request.headers, body: method !== "GET" ? request.body : undefined }));
+      return env.ROOMS.get(env.ROOMS.idFromName(roomMatch[1]!)).fetch(
+        new Request(doUrl, { method, headers: request.headers, body: method !== "GET" ? request.body : undefined })
+      );
     }
 
     if (path.startsWith("/api/")) return errorResponse("ROOM_NOT_FOUND", "", 404, crypto.randomUUID());
@@ -55,79 +46,6 @@ export default {
     return new Response("Not Found", { status: 404 });
   },
 };
-
-async function handleWebSocket(request: Request, env: Env, roomCode: string): Promise<Response> {
-  const ticket = new URL(request.url).searchParams.get("ticket") || "";
-  const secret = env.WS_TICKET_SECRET;
-  if (!secret) return new Response("no secret", { status: 500 });
-  const claims = await verifyTicket(secret, ticket);
-  if (!claims || claims.roomCode !== roomCode)
-    return new Response("invalid ticket", { status: 401 });
-  return new Response(`ok player=${claims.playerId}`, { status: 200 });
-}
-
-async function handleWsMsg(ws: WebSocket, raw: { type: string; commandId: string; expectedVersion: number; payload: unknown }, env: Env) {
-  const conn = connections.get(ws);
-  if (!conn) return;
-  const { roomCode, playerId } = conn;
-
-  const resp = await fetchDO(env, roomCode, "/command", {
-    method: "POST",
-    body: JSON.stringify({ ...raw, playerId }),
-  });
-
-  const result = await resp.json() as { success?: boolean; cause?: PublicCause; error?: { code: string; message: string }; version?: number };
-  if (result.success && result.cause) {
-    const st = await getRoomState(env, roomCode);
-    if (st) broadcast(env, roomCode, st, result.cause);
-  } else if (result.error) {
-    const errMsg: CommandError = { type: "command.error", commandId: raw.commandId, code: result.error.code as CommandError["code"], message: result.error.message, currentVersion: result.version || 0 };
-    try { ws.send(JSON.stringify(errMsg)); } catch { /* */ }
-  }
-}
-
-async function getRoomState(env: Env, roomCode: string): Promise<RoomState | null> {
-  const r = await fetchDO(env, roomCode, "/state", { method: "GET" });
-  if (!r.ok) return null;
-  const d = await r.json() as { state: RoomState | null };
-  return d.state || null;
-}
-
-async function broadcast(env: Env, roomCode: string, state: RoomState, cause: PublicCause) {
-  const presence = new Map<string, boolean>();
-  for (const [, c] of connections) if (c.roomCode === roomCode) presence.set(c.playerId, true);
-
-  for (const [, c] of connections) {
-    if (c.roomCode !== roomCode) continue;
-    const v = publicView(state, c.playerId, presence);
-    const msg: ServerMessage = { type: "room.updated", version: state.version, cause, state: v };
-    try { c.ws.send(JSON.stringify(msg)); } catch { connections.delete(c.ws); }
-  }
-}
-
-function sendSnapshot(ws: WebSocket, state: RoomState, playerId: string, roomCode: string) {
-  const presence = new Map<string, boolean>();
-  for (const [, c] of connections) if (c.roomCode === roomCode) presence.set(c.playerId, true);
-  const v = publicView(state, playerId, presence);
-  const msg: ServerMessage = { type: "room.snapshot", version: state.version, state: v };
-  try { ws.send(JSON.stringify(msg)); } catch { /* */ }
-}
-
-function publicView(state: RoomState, pid: string | null, presence: Map<string, boolean>) {
-  const ge = state.phase === "finished";
-  return {
-    roomCode: state.roomCode, phase: state.phase, version: state.version,
-    players: state.players.map(p => ({ id: p.id, seat: p.seat, name: p.name, ready: p.ready, connected: presence.get(p.id) ?? false, secret: ge || p.id === pid ? p.secret : null })),
-    currentGame: state.currentGame,
-    completedGames: state.completedGames.map(g => ({ gameNumber: g.gameNumber, firstPlayerId: g.firstPlayerId, currentPlayerId: g.currentPlayerId, winnerPlayerId: g.winnerPlayerId, loserPlayerId: g.loserPlayerId, startedAt: g.startedAt, finishedAt: g.finishedAt, turns: g.turns })),
-    previousLoserId: state.previousLoserId, rematchReadyPlayerIds: state.rematchReadyPlayerIds,
-    createdAt: state.createdAt, lastActivityAt: state.lastActivityAt, expiresAt: state.expiresAt, viewerPlayerId: pid,
-  };
-}
-
-async function fetchDO(env: Env, code: string, path: string, init: RequestInit): Promise<Response> {
-  return env.ROOMS.get(env.ROOMS.idFromName(code)).fetch(new Request(`https://do${path}`, init));
-}
 
 async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
   const rid = crypto.randomUUID();
@@ -140,7 +58,9 @@ async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
       const code = generateRoomCode();
       const t = generatePlayerToken();
       const h = await hashToken(t);
-      const r = await fetchDO(env, code, "/init", { method: "POST", body: JSON.stringify({ name, tokenHash: h, roomCode: code }) });
+      const r = await env.ROOMS.get(env.ROOMS.idFromName(code)).fetch(new Request("https://do/init", {
+        method: "POST", body: JSON.stringify({ name, tokenHash: h, roomCode: code }),
+      }));
       if (r.ok) {
         const d = await r.json() as { playerId: string };
         return jsonResponse({ roomCode: code, playerToken: t, playerId: d.playerId, roomUrl: `${url.protocol}//${url.host}/r/${code}` }, 201);
@@ -152,16 +72,4 @@ async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
   } catch (e) {
     return errorResponse("INTERNAL_ERROR", "创建失败", 500, rid);
   }
-}
-
-// ─── Crypto helpers ───
-
-async function sha1(msg: string): Promise<Uint8Array> {
-  const d = new TextEncoder().encode(msg);
-  const h = await crypto.subtle.digest("SHA-1", d);
-  return new Uint8Array(h);
-}
-
-function hexToBase64(hex: Uint8Array): string {
-  return btoa(String.fromCharCode(...hex));
 }

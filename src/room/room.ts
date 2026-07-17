@@ -24,10 +24,8 @@ export class Room extends DurableObject<RoomEnv> {
     const path = url.pathname;
     await this.load();
 
-    // WebSocket: path 以 /socket 结尾 或 Upgrade header
-    const isWs = path.endsWith("/socket");
-    const upgrade = request.headers.get("Upgrade");
-    if (isWs && upgrade === "websocket") {
+    // WebSocket: path 以 /socket 结尾（Upgrade header 被 CF 剥离，不检查）
+    if (path.endsWith("/socket")) {
       return this.handleWsUpgrade(request);
     }
 
@@ -350,6 +348,10 @@ export class Room extends DurableObject<RoomEnv> {
   private jsonRes(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } }); }
   private errorRes(code: DomainErrorCode, message: string, status: number, overrideCode?: string) { return this.jsonRes({ error: { code: overrideCode || code, message }, requestId: crypto.randomUUID() }, status); }
   private domainError(e: unknown) { if (e instanceof DomainError) return this.errorRes(e.code, e.message, domainStatus(e.code)); console.error(e); return this.errorRes("INTERNAL_ERROR", "内部错误", 500); }
+  private domainErrorToJson(e: unknown, commandId: string, version: number) {
+    if (e instanceof DomainError) return this.jsonRes({ success: false, error: { code: e.code, message: e.message }, version }, 400);
+    return this.jsonRes({ success: false, error: { code: "INTERNAL_ERROR", message: "内部错误" }, version }, 500);
+  }
 }
 
 function domainStatus(c: DomainErrorCode): number {
