@@ -24,9 +24,7 @@ export class Room extends DurableObject<RoomEnv> {
     const path = url.pathname;
     await this.load();
 
-    // WebSocket 不支持 → 改为 HTTP 轮询 + 命令
-    // /state 拉状态，/command 发命令
-    // /socket 端点不再使用，前端直接用 HTTP
+    if (path.endsWith("/socket") && request.method === "POST") return this.handleWsUpgrade(request);
 
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
     if (path.endsWith("/join") && request.method === "POST") return this.handleJoin(request);

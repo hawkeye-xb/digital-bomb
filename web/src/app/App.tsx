@@ -365,9 +365,7 @@ function RoomScreen({
   playerId,
   sendCommand,
   goHome,
-  reconnecting,
   error,
-  lastCause,
   onClearError,
 }: {
   roomState: PublicRoomView;
@@ -375,9 +373,7 @@ function RoomScreen({
   playerName: string;
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
   goHome: () => void;
-  reconnecting: boolean;
   error: string | null;
-  lastCause: PublicCause | null;
   onClearError: () => void;
 }) {
   const isCreator = roomState.players[0]?.id === playerId;
@@ -470,7 +466,6 @@ function RoomScreen({
           opponent={opponent}
           playerId={playerId}
           sendCommand={sendCommand}
-          lastCause={lastCause}
         />
       )}
       {phase === "finished" && roomState.currentGame && (
@@ -627,13 +622,15 @@ function PlayingPhase({
     setGuessInput("");
   };
 
-  const myTurns = game.turns.filter(t => t.playerId === playerId);
+  const allTurns = game.turns;
+  const rounds = groupTurnsIntoRounds(allTurns, game.firstPlayerId);
+  const myTurns = allTurns.filter(t => t.playerId === playerId);
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 10 }}>
       <div style={{ textAlign: "center" }}>
         <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
-          第 {game.gameNumber} 局 · 第 {myTurns.length + 1} 轮
+          第 {game.gameNumber} 局 · 第 {rounds.length + 1} 轮
         </span>
       </div>
 
@@ -672,13 +669,23 @@ function PlayingPhase({
         </div>
       )}
 
-      {myTurns.length > 0 && (
-        <div style={{ maxHeight: 180, overflow: "auto", marginTop: 4 }}>
+      {/* 双方历史 */}
+      {rounds.length > 0 && (
+        <div style={{ maxHeight: 200, overflow: "auto", marginTop: 4 }}>
           <div className="turn-history">
-            {myTurns.slice().reverse().map((t, i) => (
-              <div key={t.turnNumber} className="turn-row">
-                <span className="guess-num" style={{ fontSize: 13 }}>第 {myTurns.length - i} 次：猜 {t.guess}</span>
-                <span className={`hits hits-${t.hits}`} style={{ fontSize: 13 }}>{hitsText(t.hits)}</span>
+            {rounds.map((round, ri) => (
+              <div key={ri} className="round-group">
+                <div className="round-label">第 {round.ro} 轮</div>
+                {round.turns.map((t) => {
+                  const p = t.playerId === me?.id ? me : opponent;
+                  return (
+                    <div key={t.turnNumber} className="turn-row">
+                      <span className="player-name" style={{ fontSize: 13 }}>{p?.name || "?"}</span>
+                      <span className="guess-num" style={{ fontSize: 13 }}>{t.guess}</span>
+                      <span className={`hits hits-${t.hits}`} style={{ fontSize: 13 }}>{hitsText(t.hits)}</span>
+                    </div>
+                  );
+                })}
               </div>
             ))}
           </div>

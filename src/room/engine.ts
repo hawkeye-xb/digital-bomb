@@ -67,6 +67,7 @@ export function initializeRoomState(
     previousLoserId: null,
     rematchReadyPlayerIds: [],
     processedCommands: [],
+    totalGamesPlayed: 0,
     createdAt: now,
     lastActivityAt: now,
     expiresAt: now + 2 * 60 * 60 * 1000, // 2 小时
@@ -198,7 +199,8 @@ function startGame(state: RoomState, now: number): RoomState {
       ? state.previousLoserId
       : players[Math.random() < 0.5 ? 0 : 1]!.id;
 
-  const gameNumber = (state.currentGame?.gameNumber ?? 0) + 1;
+  const gameNumber = state.totalGamesPlayed + 1;
+  const nextTotal = state.totalGamesPlayed + 1;
 
   const game: Game = {
     gameNumber,
@@ -215,6 +217,7 @@ function startGame(state: RoomState, now: number): RoomState {
     ...state,
     phase: "playing",
     version: state.version + 1,
+    totalGamesPlayed: nextTotal,
     currentGame: game,
   };
 }

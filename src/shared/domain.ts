@@ -47,6 +47,7 @@ export type RoomState = {
   previousLoserId: string | null;
   rematchReadyPlayerIds: string[];
   processedCommands: ProcessedCommand[];
+  totalGamesPlayed: number;
   createdAt: number;
   lastActivityAt: number;
   expiresAt: number;
