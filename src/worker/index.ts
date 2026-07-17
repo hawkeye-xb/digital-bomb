@@ -4,7 +4,6 @@ import { Room } from "../room/room.js";
 import { errorResponse } from "./responses.js";
 import { isValidName } from "../shared/validation.js";
 import { generateRoomCode } from "../room/engine.js";
-import { generatePlayerToken, hashToken } from "./auth.js";
 import { jsonResponse } from "./responses.js";
 
 export { Room };
@@ -34,7 +33,18 @@ export default {
       const objectId = env.ROOMS.idFromName(roomCode);
       const room = env.ROOMS.get(objectId);
 
-      // 重写 URL 发给 DO
+      // WebSocket upgrade：转发原始请求（不重建，保留升级属性）
+      const isWs = request.headers.get("Upgrade") === "websocket";
+      if (isWs) {
+        // DO 不关心 URL path，但 Upgrade header 必须保留
+        const wsUrl = new URL(request.url);
+        wsUrl.protocol = "https:";
+        wsUrl.hostname = "do";
+        const wsRequest = new Request(wsUrl, request);
+        return room.fetch(wsRequest);
+      }
+
+      // HTTP 请求：重写 URL 发给 DO
       const doUrl = new URL(`https://do${roomMatch[2] || ""}`);
       const doRequest = new Request(doUrl, {
         method: request.method,
@@ -97,10 +107,8 @@ async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
 
       const err = await resp.json().catch(() => null) as { error?: { code?: string } } | null;
       if (err?.error?.code !== "ALREADY_EXISTS") {
-        // 非冲突错误，返回
         return jsonResponse(err, resp.status);
       }
-      // 冲突，重试
     }
 
     return errorResponse("INTERNAL_ERROR", "无法创建房间，请重试", 500, requestId);
