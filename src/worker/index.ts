@@ -4,7 +4,7 @@ import { Room } from "../room/room.js";
 import { errorResponse, jsonResponse } from "./responses.js";
 import { isValidName } from "../shared/validation.js";
 import { generateRoomCode } from "../room/engine.js";
-import { generatePlayerToken, hashToken } from "./auth.js";
+import { generatePlayerToken, hashToken, verifyTicket } from "./auth.js";
 
 export { Room };
 
@@ -20,12 +20,27 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // WebSocket: Worker 验证 ticket，传 playerId 给 DO
-    // 注意：DO 返回的 101+webSocket 无法通过 stub.fetch() 转发（1101）
-    // 因此当前仍使用 HTTP 轮询。未来可让客户端直连 DO 的 wss 端点。
+    // WebSocket: edge Worker verifies the short-lived ticket, then proxies the
+    // original Upgrade request to the room's Durable Object.
     const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
     if (wsMatch) {
-      return errorResponse("NOT_IMPLEMENTED", "WebSocket 暂不可用，请刷新页面", 503, crypto.randomUUID());
+      if (method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return errorResponse("INVALID_INPUT", "需要 WebSocket 连接", 426, crypto.randomUUID());
+      }
+      if (!env.WS_TICKET_SECRET) {
+        return errorResponse("INTERNAL_ERROR", "服务未配置", 500, crypto.randomUUID());
+      }
+      const roomCode = wsMatch[1]!;
+      const claims = await verifyTicket(env.WS_TICKET_SECRET, url.searchParams.get("ticket") || "");
+      if (!claims || claims.roomCode !== roomCode) {
+        return errorResponse("TICKET_INVALID", "连接凭证无效或已过期", 401, crypto.randomUUID());
+      }
+
+      const headers = new Headers(request.headers);
+      headers.set("X-Verified-Player-Id", claims.playerId);
+      return env.ROOMS
+        .get(env.ROOMS.idFromName(roomCode))
+        .fetch(new Request(request, { headers }));
     }
 
     if (path === "/api/rooms" && method === "POST") {

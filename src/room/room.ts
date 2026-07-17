@@ -1,53 +1,68 @@
-// ─── Room Durable Object — HTTP + WebSocket ───
+// ─── Room Durable Object — authoritative state + hibernatable WebSockets ───
 
 import { DurableObject } from "cloudflare:workers";
-import type { RoomState, PublicCause, PublicPlayer, PublicGame } from "../shared/domain.js";
-import type { ServerMessage } from "../shared/protocol.js";
-import type { DomainErrorCode } from "../shared/protocol.js";
-import { DomainError, isValidName, isValidGuess } from "../shared/validation.js";
+import type {
+  InteractionKind,
+  PlayerActivity,
+  PublicCause,
+  RoomState,
+} from "../shared/domain.js";
+import type {
+  ClientCommand,
+  ClientMessage,
+  DomainErrorCode,
+  ServerMessage,
+} from "../shared/protocol.js";
+import { DomainError, isValidName } from "../shared/validation.js";
 import {
-  initializeRoomState, createPlayer, addPlayer,
-  readySet, readyUnset, submitGuess, rematchSet, isExpired,
+  addPlayer,
+  createPlayer,
+  initializeRoomState,
+  isExpired,
+  readySet,
+  readyUnset,
+  rematchSet,
+  submitGuess,
 } from "./engine.js";
-import { loadState, saveState, deleteAllState } from "./storage.js";
+import { toPublicRoomView } from "./public-view.js";
+import { deleteAllState, loadState, saveState } from "./storage.js";
 
-type SocketAttachment = { playerId: string; connectedAt: number };
+type SocketAttachment = {
+  playerId: string;
+  connectedAt: number;
+  activity: PlayerActivity;
+  lastInteractionAt: number;
+};
 
-export interface RoomEnv { WS_TICKET_SECRET: string; }
+type CommandBody = ClientCommand<string, Record<string, unknown>>;
+type CommandResult = { cause?: PublicCause; duplicate?: boolean };
+
+const INTERACTIONS = new Set<InteractionKind>(["nudge", "almost", "nice", "rematch"]);
+const INTERACTION_COOLDOWN_MS = 3_000;
+
+export interface RoomEnv {
+  WS_TICKET_SECRET: string;
+}
 
 export class Room extends DurableObject<RoomEnv> {
   private state: RoomState | null = null;
   private loaded = false;
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
     await this.load();
+    const path = new URL(request.url).pathname;
 
-    if (path.endsWith("/socket") && request.method === "POST") return this.handleWsUpgrade(request);
-
+    if (path.endsWith("/socket") && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return this.handleWsUpgrade(request);
+    }
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
     if (path.endsWith("/join") && request.method === "POST") return this.handleJoin(request);
     if (path.endsWith("/socket-ticket") && request.method === "POST") return this.handleTicket(request);
-    if (path.endsWith("/state") && request.method === "GET") {
-      // 通过 Authorization header 识别玩家，返回脱敏视图
-      const auth = request.headers.get("Authorization") || "";
-      const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-      let viewerId: string | null = null;
-      if (token && this.state) {
-        const { hashToken } = await import("../worker/auth.js");
-        const th = await hashToken(token);
-        const player = this.state.players.find(p => p.tokenHash === th);
-        viewerId = player?.id || null;
-      }
-      return this.jsonRes({ state: this.publicView(viewerId) });
-    }
-    if (path.endsWith("/command") && request.method === "POST") return this.handleCommand(request);
+    if (path.endsWith("/state") && request.method === "GET") return this.handleState(request);
+    if (path.endsWith("/command") && request.method === "POST") return this.handleHttpCommand(request);
 
     return this.errorRes("ROOM_NOT_FOUND", "未知操作", 404);
   }
-
-  // ─── Init / Join / Ticket ───
 
   private async handleInit(request: Request): Promise<Response> {
     if (this.state) return this.errorRes("COMMAND_REJECTED", "房间已存在", 409, "ALREADY_EXISTS");
@@ -56,6 +71,7 @@ export class Room extends DurableObject<RoomEnv> {
     const tokenHash = String(body?.tokenHash || "");
     const roomCode = String(body?.roomCode || "");
     if (!isValidName(name)) return this.errorRes("INVALID_NAME", "昵称不合法", 400);
+
     const player = createPlayer(crypto.randomUUID(), name, tokenHash, 1);
     this.state = initializeRoomState(roomCode, player, Date.now());
     await this.persist();
@@ -69,301 +85,391 @@ export class Room extends DurableObject<RoomEnv> {
     const tokenHash = String(body?.tokenHash || "");
     if (!isValidName(name)) return this.errorRes("INVALID_NAME", "昵称不合法", 400);
 
-    const existing = this.state.players.find(p => p.tokenHash === tokenHash);
-    if (existing) return this.jsonRes({ playerId: existing.id, playerToken: "", roomState: this.publicView(existing.id) });
+    const existing = this.state.players.find((p) => p.tokenHash === tokenHash);
+    if (existing) {
+      return this.jsonRes({
+        playerId: existing.id,
+        playerToken: "",
+        roomState: this.publicView(existing.id),
+      });
+    }
     if (this.state.players.length >= 2) return this.errorRes("ROOM_FULL", "房间已满", 409);
 
     const { generatePlayerToken, hashToken } = await import("../worker/auth.js");
     const playerId = crypto.randomUUID();
     const token = generatePlayerToken();
-    const hash = await hashToken(token);
-    const player = createPlayer(playerId, name, hash, 2);
-    try { this.state = addPlayer(this.state, player, Date.now()); } catch (e) { return this.domainError(e); }
-    await this.persist();
-    return this.jsonRes({ playerId, playerToken: token, roomState: this.publicView(playerId) });
+    const player = createPlayer(playerId, name, await hashToken(token), 2);
+    try {
+      this.state = addPlayer(this.state, player, Date.now());
+      await this.persist();
+      this.broadcastState({ type: "player.joined", playerId });
+      return this.jsonRes({
+        playerId,
+        playerToken: token,
+        roomState: this.publicView(playerId),
+      });
+    } catch (error) {
+      return this.domainError(error);
+    }
   }
 
   private async handleTicket(request: Request): Promise<Response> {
-    if (!this.state) return this.roomNotFound();
-    const auth = request.headers.get("Authorization") || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (!token) return this.errorRes("UNAUTHORIZED", "缺少凭证", 401);
-    const { hashToken } = await import("../worker/auth.js");
-    const th = await hashToken(token);
-    const player = this.state.players.find(p => p.tokenHash === th);
-    if (!player) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
+    const player = await this.authenticate(request);
+    if (!player || !this.state) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
+    if (!this.env.WS_TICKET_SECRET) return this.errorRes("INTERNAL_ERROR", "服务未配置", 500);
+
     const { signTicket } = await import("../worker/auth.js");
-    const secret = this.env.WS_TICKET_SECRET;
-    if (!secret) return this.errorRes("INTERNAL_ERROR", "missing secret", 500);
-    const claims = { roomCode: this.state.roomCode, playerId: player.id, expiresAt: Date.now() + 60000, nonce: crypto.randomUUID() };
-    const ticketStr = await signTicket(secret, claims);
-    return this.jsonRes({ ticket: ticketStr, expiresAt: claims.expiresAt });
+    const claims = {
+      roomCode: this.state.roomCode,
+      playerId: player.id,
+      expiresAt: Date.now() + 60_000,
+      nonce: crypto.randomUUID(),
+    };
+    return this.jsonRes({
+      ticket: await signTicket(this.env.WS_TICKET_SECRET, claims),
+      expiresAt: claims.expiresAt,
+    });
   }
 
-  // ─── Command (Worker→DO HTTP) ───
-
-  private async handleCommand(request: Request): Promise<Response> {
-    if (!this.state) return this.roomNotFound();
-    // 从 Authorization header 识别玩家
-    const auth = request.headers.get("Authorization") || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (!token) return this.errorRes("UNAUTHORIZED", "缺少凭证", 401);
-    const { hashToken } = await import("../worker/auth.js");
-    const th = await hashToken(token);
-    const player = this.state.players.find(p => p.tokenHash === th);
+  private async handleState(request: Request): Promise<Response> {
+    const player = await this.authenticate(request);
     if (!player) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
-    const playerId = player.id;
+    return this.jsonRes({ state: this.publicView(player.id) });
+  }
 
-    const b = await reqJson(request);
-    const { type, commandId, expectedVersion, payload } = b as {
-      type: string; commandId: string; expectedVersion: number;
-      payload: Record<string, unknown>;
-    };
+  private async handleHttpCommand(request: Request): Promise<Response> {
+    const player = await this.authenticate(request);
+    if (!player || !this.state) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
+    const body = await reqJson(request) as CommandBody | null;
+    if (!body) return this.errorRes("INVALID_INPUT", "无效命令", 400);
 
     try {
-      switch (type) {
-        case "ready.set": {
-          const secret = String(payload?.secret || "");
-          if (!isValidGuess(secret)) throw new DomainError("INVALID_SECRET", "密码不是四位数字");
-          const { state } = readySet(this.state, playerId, secret, commandId, Date.now());
-          this.state = state; await this.persist();
-          const cause = state.phase === "playing" && state.currentGame
-            ? { type: "game.started" as const, firstPlayerId: state.currentGame.firstPlayerId }
-            : { type: "ready.changed" as const, playerId, ready: true };
-          return this.jsonRes({ success: true, version: state.version, cause });
-        }
-        case "ready.unset": {
-          const { state } = readyUnset(this.state, playerId, commandId, Date.now());
-          this.state = state; await this.persist();
-          return this.jsonRes({ success: true, version: state.version, cause: { type: "ready.changed" as const, playerId, ready: false } });
-        }
-        case "guess.submit": {
-          const guess = String(payload?.guess || "");
-          if (!isValidGuess(guess)) throw new DomainError("INVALID_GUESS", "猜测不是四位数字");
-          const { state, hitResult } = submitGuess(this.state, playerId, guess, commandId, expectedVersion, Date.now());
-          this.state = state; await this.persist();
-          return this.jsonRes({ success: true, version: state.version, cause: { type: "guess.resolved" as const, playerId, guess, hits: hitResult.hits, won: hitResult.won } });
-        }
-        case "rematch.set": {
-          const ready = Boolean(payload?.ready);
-          const { state } = rematchSet(this.state, playerId, ready, commandId, Date.now());
-          this.state = state; await this.persist();
-          let cause: Record<string, unknown>;
-          if (state.phase === "preparing" && state.completedGames.length > 0 && state.previousLoserId) {
-            cause = { type: "game.reset", firstPlayerId: state.previousLoserId };
-          } else {
-            cause = { type: "rematch.changed", playerId, ready };
-          }
-          return this.jsonRes({ success: true, version: state.version, cause });
-        }
-        default:
-          return this.errorRes("COMMAND_REJECTED", `未知命令: ${type}`, 400);
-      }
-    } catch (e) {
-      return this.domainErrorToJson(e, commandId, this.state?.version || 0);
+      const result = await this.applyCommand(player.id, body);
+      if (result.cause) this.broadcastState(result.cause);
+      return this.jsonRes({
+        success: true,
+        version: this.state.version,
+        cause: result.cause,
+        duplicate: result.duplicate ?? false,
+      });
+    } catch (error) {
+      return this.domainErrorToJson(error, this.state.version);
     }
   }
-
-  // ─── WebSocket Upgrade ───
 
   private async handleWsUpgrade(request: Request): Promise<Response> {
     if (!this.state) return this.roomNotFound();
-
-    // Worker 已验证，直接从 body 读取 playerId
-    const b = await reqJson(request);
-    const playerId = b?.playerId as string | undefined;
-    if (!playerId) return this.errorRes("UNAUTHORIZED", "missing playerId", 401);
-
-    const player = this.state.players.find(p => p.id === playerId);
+    // This header is injected only after the outer Worker verifies the signed ticket.
+    const playerId = request.headers.get("X-Verified-Player-Id") || "";
+    const player = this.state.players.find((candidate) => candidate.id === playerId);
     if (!player) return this.errorRes("UNAUTHORIZED", "玩家不在房间", 401);
 
-    // 创建 WebSocket pair
     const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
 
-    // 关闭旧连接
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      try {
-        const a = ws.deserializeAttachment() as SocketAttachment | null;
-        if (a?.playerId === player.id) ws.close(4001, "replaced");
-      } catch { /* noop */ }
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = readAttachment(socket);
+      if (attachment?.playerId === playerId) {
+        try { socket.close(4001, "replaced"); } catch { /* already closed */ }
+      }
     }
 
-    // 接受新连接
-    this.ctx.acceptWebSocket(server as never);
-    (server as WebSocket).serializeAttachment({ playerId: player.id, connectedAt: Date.now() } satisfies SocketAttachment);
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({
+      playerId,
+      connectedAt: Date.now(),
+      activity: "idle",
+      lastInteractionAt: 0,
+    } satisfies SocketAttachment);
 
-    // 发送 snapshot
     const snapshot: ServerMessage = {
       type: "room.snapshot",
       version: this.state.version,
-      state: this.publicView(player.id),
+      state: this.publicView(playerId),
     };
-    (server as WebSocket).send(JSON.stringify(snapshot));
+    server.send(JSON.stringify(snapshot));
+    this.broadcastPresence(playerId, true, "idle");
 
-    // 广播加入
-    this.broadcastExcept(player.id, {
-      type: "room.updated",
-      version: this.state.version,
-      cause: { type: "player.joined", playerId: player.id },
-      state: this.publicView(player.id),
-    });
-
-    return new Response(null, { status: 101, webSocket: client as never });
+    return new Response(null, { status: 101, webSocket: client } as never);
   }
 
-  // ─── WebSocket 消息 ───
-
-  async webSocketMessage(ws: WebSocket, raw: string) {
-    const att = ws.deserializeAttachment() as SocketAttachment | null;
-    if (!att || !this.state) return;
+  async webSocketMessage(socket: WebSocket, raw: string | ArrayBuffer): Promise<void> {
+    const attachment = readAttachment(socket);
+    if (!attachment || !this.state || typeof raw !== "string") return;
 
     try {
-      const msg = JSON.parse(raw);
-      const { type, commandId, expectedVersion, payload } = msg;
-      const pid = att.playerId;
-
-      let result: { success: boolean; cause?: PublicCause | { type: string; firstPlayerId: string } } = { success: false };
-      let err: Error | null = null;
-
-      switch (type) {
-        case "ready.set": {
-          try { result = { success: true, cause: { type: "ready.changed" as const, playerId: pid, ready: true } };
-            const { state } = readySet(this.state, pid, String(payload?.secret || ""), commandId, Date.now());
-            this.state = state; await this.persist();
-            if (state.phase === "playing" && state.currentGame)
-              result.cause = { type: "game.started" as const, firstPlayerId: state.currentGame.firstPlayerId };
-          } catch (e) { err = e as Error; } break;
-        }
-        case "ready.unset": {
-          try { const { state } = readyUnset(this.state, pid, commandId, Date.now());
-            this.state = state; await this.persist();
-            result = { success: true, cause: { type: "ready.changed" as const, playerId: pid, ready: false } };
-          } catch (e) { err = e as Error; } break;
-        }
-        case "guess.submit": {
-          try { const { state, hitResult } = submitGuess(this.state, pid, String(payload?.guess || ""), commandId, expectedVersion, Date.now());
-            this.state = state; await this.persist();
-            result = { success: true, cause: { type: "guess.resolved" as const, playerId: pid, guess: String(payload?.guess || ""), hits: hitResult.hits, won: hitResult.won } };
-          } catch (e) { err = e as Error; } break;
-        }
-        case "rematch.set": {
-          try { const { state } = rematchSet(this.state, pid, Boolean(payload?.ready), commandId, Date.now());
-            this.state = state; await this.persist();
-            if (state.phase === "preparing" && state.completedGames.length > 0 && state.previousLoserId)
-              result = { success: true, cause: { type: "game.reset" as const, firstPlayerId: state.previousLoserId } };
-            else result = { success: true, cause: { type: "rematch.changed" as const, playerId: pid, ready: Boolean(payload?.ready) } };
-          } catch (e) { err = e as Error; } break;
-        }
-        case "state.request": {
-          const snap: ServerMessage = { type: "room.snapshot", version: this.state.version, state: this.publicView(pid) };
-          try { ws.send(JSON.stringify(snap)); } catch { /* noop */ }
-          return;
-        }
+      const message = JSON.parse(raw) as ClientMessage;
+      if (message.type === "presence.update") {
+        const activity: PlayerActivity = ["idle", "typing", "thinking"].includes(message.activity)
+          ? message.activity
+          : "idle";
+        socket.serializeAttachment({ ...attachment, activity });
+        this.broadcastPresence(attachment.playerId, true, activity);
+        return;
       }
 
-      if (err instanceof DomainError) {
-        try {
-          ws.send(JSON.stringify({ type: "command.error", commandId, code: err.code, message: err.message, currentVersion: this.state.version }));
-        } catch { /* noop */ }
-      } else if (err) {
-        try {
-          ws.send(JSON.stringify({ type: "command.error", commandId, code: "INTERNAL_ERROR", message: "内部错误", currentVersion: this.state?.version ?? 0 }));
-        } catch { /* noop */ }
-      } else if (result.success && result.cause) {
-        this.broadcastToAll(result.cause);
+      if (message.type === "interaction.send") {
+        if (!INTERACTIONS.has(message.interaction)) return;
+        const now = Date.now();
+        if (now - attachment.lastInteractionAt < INTERACTION_COOLDOWN_MS) return;
+        socket.serializeAttachment({ ...attachment, lastInteractionAt: now });
+        this.sendToOpponent(attachment.playerId, {
+          type: "interaction.received",
+          fromPlayerId: attachment.playerId,
+          interaction: message.interaction,
+          createdAt: now,
+        });
+        return;
       }
-    } catch {
-      try { ws.send(JSON.stringify({ type: "command.error", commandId: "", code: "INVALID_INPUT", message: "无效消息", currentVersion: this.state?.version ?? 0 })); } catch { /* noop */ }
+
+      if (message.type === "state.request") {
+        socket.send(JSON.stringify({
+          type: "room.snapshot",
+          version: this.state.version,
+          state: this.publicView(attachment.playerId),
+        } satisfies ServerMessage));
+        return;
+      }
+
+      const result = await this.applyCommand(attachment.playerId, message as CommandBody);
+      if (result.cause) this.broadcastState(result.cause);
+      else if (result.duplicate) {
+        socket.send(JSON.stringify({
+          type: "room.snapshot",
+          version: this.state.version,
+          state: this.publicView(attachment.playerId),
+        } satisfies ServerMessage));
+      }
+    } catch (error) {
+      const domain = error instanceof DomainError
+        ? error
+        : new DomainError("INTERNAL_ERROR", "内部错误");
+      const commandId = safeCommandId(raw);
+      try {
+        socket.send(JSON.stringify({
+          type: "command.error",
+          commandId,
+          code: domain.code,
+          message: domain.message,
+          currentVersion: this.state?.version ?? 0,
+        } satisfies ServerMessage));
+      } catch { /* socket is gone */ }
     }
   }
 
-  webSocketClose(ws: WebSocket) {
-    this.broadcastToAll(undefined);
+  webSocketClose(socket: WebSocket): void {
+    const attachment = readAttachment(socket);
+    if (!attachment) return;
+    const stillConnected = this.ctx.getWebSockets().some((candidate) => {
+      if (candidate === socket) return false;
+      return readAttachment(candidate)?.playerId === attachment.playerId;
+    });
+    this.broadcastPresence(attachment.playerId, stillConnected, "idle");
   }
 
-  webSocketError(_ws: WebSocket, _err: unknown) {}
-
-  // ─── Alarm ───
+  webSocketError(socket: WebSocket): void {
+    try { socket.close(1011, "socket error"); } catch { /* already closed */ }
+  }
 
   async alarm(): Promise<void> {
     await this.load();
     if (!this.state) return;
-    if (!isExpired(this.state, Date.now())) { await this.ctx.storage.setAlarm(this.state.expiresAt); return; }
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      try { ws.send(JSON.stringify({ type: "room.expired" })); ws.close(4002, "expired"); } catch { /* noop */ }
+    if (!isExpired(this.state, Date.now())) {
+      await this.ctx.storage.setAlarm(this.state.expiresAt);
+      return;
+    }
+    for (const socket of this.ctx.getWebSockets()) {
+      try {
+        socket.send(JSON.stringify({ type: "room.expired" } satisfies ServerMessage));
+        socket.close(4002, "expired");
+      } catch { /* already closed */ }
     }
     await deleteAllState(this.ctx.storage);
+    this.state = null;
   }
 
-  // ─── 广播 ───
+  private async applyCommand(playerId: string, body: CommandBody): Promise<CommandResult> {
+    if (!this.state) throw new DomainError("ROOM_NOT_FOUND", "房间不存在");
+    if (!body.commandId || typeof body.expectedVersion !== "number") {
+      throw new DomainError("INVALID_INPUT", "命令格式错误");
+    }
+    const payload = body.payload || {};
+    const now = Date.now();
 
-  private broadcastToAll(cause: PublicCause | undefined | { type: string; firstPlayerId: string } | { type: string; playerId: string; ready: boolean } | { type: string; playerId: string; guess: string; hits: number; won: boolean }) {
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      const att = ws.deserializeAttachment() as SocketAttachment | null;
-      if (!att) continue;
-      const view = this.publicView(att.playerId);
-      const msg: ServerMessage = cause
-        ? { type: "room.updated", version: this.state!.version, cause: cause as PublicCause, state: view }
-        : { type: "room.snapshot", version: this.state!.version, state: view };
-      try { ws.send(JSON.stringify(msg)); } catch { /* noop */ }
+    switch (body.type) {
+      case "ready.set": {
+        const previousPhase = this.state.phase;
+        const { state } = readySet(this.state, playerId, String(payload.secret || ""), body.commandId, now);
+        const duplicate = state === this.state;
+        this.state = state;
+        if (!duplicate) await this.persist();
+        return {
+          duplicate,
+          cause: duplicate ? undefined : previousPhase !== state.phase && state.currentGame
+            ? { type: "game.started", firstPlayerId: state.currentGame.firstPlayerId }
+            : { type: "ready.changed", playerId, ready: true },
+        };
+      }
+      case "ready.unset": {
+        const { state } = readyUnset(this.state, playerId, body.commandId, now);
+        const duplicate = state === this.state;
+        this.state = state;
+        if (!duplicate) await this.persist();
+        return { duplicate, cause: duplicate ? undefined : { type: "ready.changed", playerId, ready: false } };
+      }
+      case "guess.submit": {
+        const guess = String(payload.guess || "");
+        const result = submitGuess(this.state, playerId, guess, body.commandId, body.expectedVersion, now);
+        this.state = result.state;
+        if (!result.duplicate) await this.persist();
+        return {
+          duplicate: result.duplicate,
+          cause: result.hitResult ? {
+            type: "guess.resolved",
+            playerId,
+            guess,
+            hits: result.hitResult.hits,
+            won: result.hitResult.won,
+          } : undefined,
+        };
+      }
+      case "rematch.set": {
+        const previousPhase = this.state.phase;
+        const ready = Boolean(payload.ready);
+        const { state } = rematchSet(this.state, playerId, ready, body.commandId, now);
+        const duplicate = state === this.state;
+        this.state = state;
+        if (!duplicate) await this.persist();
+        return {
+          duplicate,
+          cause: duplicate ? undefined : previousPhase !== state.phase && state.previousLoserId
+            ? { type: "game.reset", firstPlayerId: state.previousLoserId }
+            : { type: "rematch.changed", playerId, ready },
+        };
+      }
+      default:
+        throw new DomainError("COMMAND_REJECTED", `未知命令: ${body.type}`);
     }
   }
 
-  private broadcastExcept(excludeId: string, msg: ServerMessage) {
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      const att = ws.deserializeAttachment() as SocketAttachment | null;
-      if (!att || att.playerId === excludeId) continue;
-      try { ws.send(JSON.stringify(msg)); } catch { /* noop */ }
+  private broadcastState(cause: PublicCause): void {
+    if (!this.state) return;
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = readAttachment(socket);
+      if (!attachment) continue;
+      this.send(socket, {
+        type: "room.updated",
+        version: this.state.version,
+        cause,
+        state: this.publicView(attachment.playerId),
+      });
     }
   }
 
-  // ─── 辅助 ───
-
-  private async load() { if (this.loaded) return; this.state = await loadState(this.ctx.storage); this.loaded = true; }
-  private async persist() { if (!this.state) return; await saveState(this.ctx.storage, this.state); await this.ctx.storage.setAlarm(this.state.expiresAt); }
-  private roomNotFound() { return this.errorRes("ROOM_NOT_FOUND", "房间不存在", 404); }
-
-  private publicView(playerId: string | null) {
-    if (!this.state) return null as never;
-    const gameEnded = this.state.phase === "finished";
-    const sockets = this.ctx.getWebSockets();
-    const presence = new Map<string, boolean>();
-    for (const ws of sockets) {
-      try { const a = ws.deserializeAttachment() as SocketAttachment | null; if (a) presence.set(a.playerId, true); } catch { /* noop */ }
-    }
-    return {
-      roomCode: this.state.roomCode, phase: this.state.phase, version: this.state.version,
-      players: this.state.players.map(p => ({
-        id: p.id, seat: p.seat, name: p.name, ready: p.ready,
-        connected: presence.get(p.id) ?? false,
-        secret: gameEnded || p.id === playerId ? p.secret : null,
-      })),
-      currentGame: this.state.currentGame,
-      completedGames: this.state.completedGames.map(g => ({ gameNumber: g.gameNumber, firstPlayerId: g.firstPlayerId, currentPlayerId: g.currentPlayerId, winnerPlayerId: g.winnerPlayerId, loserPlayerId: g.loserPlayerId, startedAt: g.startedAt, finishedAt: g.finishedAt, turns: g.turns })),
-      previousLoserId: this.state.previousLoserId, rematchReadyPlayerIds: this.state.rematchReadyPlayerIds,
-      createdAt: this.state.createdAt, lastActivityAt: this.state.lastActivityAt, expiresAt: this.state.expiresAt,
-      viewerPlayerId: playerId,
-    };
+  private broadcastPresence(playerId: string, connected: boolean, activity: PlayerActivity): void {
+    const message: ServerMessage = { type: "presence.updated", playerId, connected, activity };
+    for (const socket of this.ctx.getWebSockets()) this.send(socket, message);
   }
 
-  private jsonRes(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } }); }
-  private errorRes(code: DomainErrorCode, message: string, status: number, overrideCode?: string) { return this.jsonRes({ error: { code: overrideCode || code, message }, requestId: crypto.randomUUID() }, status); }
-  private domainError(e: unknown) { if (e instanceof DomainError) return this.errorRes(e.code, e.message, domainStatus(e.code)); console.error(e); return this.errorRes("INTERNAL_ERROR", "内部错误", 500); }
-  private domainErrorToJson(e: unknown, commandId: string, version: number) {
-    if (e instanceof DomainError) return this.jsonRes({ success: false, error: { code: e.code, message: e.message }, version }, 400);
+  private sendToOpponent(playerId: string, message: ServerMessage): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = readAttachment(socket);
+      if (attachment && attachment.playerId !== playerId) this.send(socket, message);
+    }
+  }
+
+  private send(socket: WebSocket, message: ServerMessage): void {
+    try { socket.send(JSON.stringify(message)); } catch { /* reconnect will restore state */ }
+  }
+
+  private publicView(playerId: string) {
+    if (!this.state) throw new DomainError("ROOM_NOT_FOUND", "房间不存在");
+    const presence = new Map<string, { connected: boolean; activity: PlayerActivity }>();
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = readAttachment(socket);
+      if (attachment) presence.set(attachment.playerId, { connected: true, activity: attachment.activity });
+    }
+    return toPublicRoomView(this.state, playerId, presence);
+  }
+
+  private async authenticate(request: Request) {
+    if (!this.state) return null;
+    const auth = request.headers.get("Authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (!token) return null;
+    const { hashToken } = await import("../worker/auth.js");
+    const tokenHash = await hashToken(token);
+    return this.state.players.find((player) => player.tokenHash === tokenHash) ?? null;
+  }
+
+  private async load(): Promise<void> {
+    if (this.loaded) return;
+    this.state = await loadState(this.ctx.storage);
+    this.loaded = true;
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.state) return;
+    await saveState(this.ctx.storage, this.state);
+    await this.ctx.storage.setAlarm(this.state.expiresAt);
+  }
+
+  private roomNotFound(): Response {
+    return this.errorRes("ROOM_NOT_FOUND", "房间不存在", 404);
+  }
+
+  private jsonRes(data: unknown, status = 200): Response {
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+      },
+    });
+  }
+
+  private errorRes(code: DomainErrorCode, message: string, status: number, overrideCode?: string): Response {
+    return this.jsonRes({ error: { code: overrideCode || code, message }, requestId: crypto.randomUUID() }, status);
+  }
+
+  private domainError(error: unknown): Response {
+    if (error instanceof DomainError) return this.errorRes(error.code, error.message, domainStatus(error.code));
+    console.error(error);
+    return this.errorRes("INTERNAL_ERROR", "内部错误", 500);
+  }
+
+  private domainErrorToJson(error: unknown, version: number): Response {
+    if (error instanceof DomainError) {
+      return this.jsonRes({ success: false, error: { code: error.code, message: error.message }, version }, domainStatus(error.code));
+    }
+    console.error(error);
     return this.jsonRes({ success: false, error: { code: "INTERNAL_ERROR", message: "内部错误" }, version }, 500);
   }
 }
 
-function domainStatus(c: DomainErrorCode): number {
-  switch (c) { case "ROOM_NOT_FOUND": return 404; case "UNAUTHORIZED": case "TICKET_INVALID": return 401; case "ROOM_FULL": return 409; case "VERSION_CONFLICT": return 409; default: return 400; }
+function readAttachment(socket: WebSocket): SocketAttachment | null {
+  try { return socket.deserializeAttachment() as SocketAttachment | null; } catch { return null; }
 }
 
-async function reqJson(r: Request): Promise<Record<string, unknown> | null> {
-  try { return await r.json() as Record<string, unknown>; } catch { return null; }
+function safeCommandId(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw) as { commandId?: unknown };
+    return typeof parsed.commandId === "string" ? parsed.commandId : "";
+  } catch { return ""; }
+}
+
+function domainStatus(code: DomainErrorCode): number {
+  switch (code) {
+    case "ROOM_NOT_FOUND": return 404;
+    case "UNAUTHORIZED":
+    case "TICKET_INVALID": return 401;
+    case "ROOM_FULL":
+    case "VERSION_CONFLICT": return 409;
+    default: return 400;
+  }
+}
+
+async function reqJson(request: Request): Promise<Record<string, unknown> | null> {
+  try { return await request.json() as Record<string, unknown>; } catch { return null; }
 }

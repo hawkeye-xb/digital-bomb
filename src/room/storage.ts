@@ -9,7 +9,10 @@ export async function loadState(storage: DurableObjectStorage): Promise<RoomStat
   const raw = await storage.get<string>(STATE_KEY);
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as RoomState;
+    const state = JSON.parse(raw) as RoomState;
+    // schema v1 的早期房间没有该字段；以已有对局数补齐，避免 NaN。
+    state.totalGamesPlayed ??= state.completedGames.length + (state.currentGame ? 1 : 0);
+    return state;
   } catch {
     return null;
   }

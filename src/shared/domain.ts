@@ -1,6 +1,8 @@
 // ─── 领域类型：房间、玩家、游戏、回合 ───
 
 export type RoomPhase = "waiting" | "preparing" | "playing" | "finished" | "expired";
+export type PlayerActivity = "idle" | "typing" | "thinking";
+export type InteractionKind = "nudge" | "almost" | "nice" | "rematch";
 
 export type PrivatePlayer = {
   id: string;
@@ -61,6 +63,7 @@ export type PublicPlayer = {
   name: string;
   ready: boolean;
   connected: boolean;
+  activity: PlayerActivity;
   secret: string | null; // 游戏结束前只展示自己的 secret
 };
 

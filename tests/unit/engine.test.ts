@@ -166,8 +166,8 @@ describe("猜测流程", () => {
     const { state, hitResult } = submitGuess(
       playing, cur, oppSecret, "cmd3", playing.version, 5000,
     );
-    expect(hitResult.won).toBe(true);
-    expect(hitResult.hits).toBe(4);
+    expect(hitResult!.won).toBe(true);
+    expect(hitResult!.hits).toBe(4);
     expect(state.phase).toBe("finished");
     expect(state.currentGame!.winnerPlayerId).toBe(cur);
     expect(state.currentGame!.loserPlayerId).toBe(opp.id);
@@ -195,8 +195,10 @@ describe("猜测流程", () => {
   it("幂等 commandId 不产生重复 turn", () => {
     const cur = playing.currentGame!.currentPlayerId!;
     const { state: s1 } = submitGuess(playing, cur, "0000", "cmd3", playing.version, 5000);
-    const { state: s2 } = submitGuess(s1, cur, "0000", "cmd3", s1.version, 6000);
+    const { state: s2, duplicate, hitResult } = submitGuess(s1, cur, "0000", "cmd3", s1.version, 6000);
     expect(s2.currentGame!.turns).toHaveLength(1);
+    expect(duplicate).toBe(true);
+    expect(hitResult).toBeNull();
   });
 });
 

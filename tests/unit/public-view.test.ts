@@ -14,16 +14,17 @@ function makeTwoPlayerRoom(): { room: RoomState; p1Id: string; p2Id: string } {
 }
 
 describe("toPublicRoomView", () => {
+  const online = { connected: true, activity: "idle" as const };
   it("游戏结束前绝不泄露对方 secret", () => {
     let { room } = makeTwoPlayerRoom();
     const { state: s1 } = readySet(room, "p1", "1111", "c1", 3000);
     const { state: s2 } = readySet(s1, "p2", "2222", "c2", 3000);
 
-    const viewP1 = toPublicRoomView(s2, "p1", new Map([["p1", true], ["p2", true]]));
+    const viewP1 = toPublicRoomView(s2, "p1", new Map([["p1", online], ["p2", online]]));
     expect(viewP1.players.find((p: { id: string; secret: string | null }) => p.id === "p1")!.secret).toBe("1111");
     expect(viewP1.players.find((p: { id: string; secret: string | null }) => p.id === "p2")!.secret).toBeNull();
 
-    const viewP2 = toPublicRoomView(s2, "p2", new Map([["p1", true], ["p2", true]]));
+    const viewP2 = toPublicRoomView(s2, "p2", new Map([["p1", online], ["p2", online]]));
     expect(viewP2.players.find((p: { id: string; secret: string | null }) => p.id === "p1")!.secret).toBeNull();
     expect(viewP2.players.find((p: { id: string; secret: string | null }) => p.id === "p2")!.secret).toBe("2222");
   });
@@ -61,8 +62,9 @@ describe("toPublicRoomView", () => {
 
   it("presence 正确反映连接状态", () => {
     const { room } = makeTwoPlayerRoom();
-    const view = toPublicRoomView(room, "p1", new Map([["p1", true]]));
+    const view = toPublicRoomView(room, "p1", new Map([["p1", { connected: true, activity: "typing" as const }]]));
     expect(view.players.find((p: { id: string }) => p.id === "p1")!.connected).toBe(true);
+    expect(view.players.find((p: { id: string }) => p.id === "p1")!.activity).toBe("typing");
     expect(view.players.find((p: { id: string }) => p.id === "p2")!.connected).toBe(false);
   });
 });

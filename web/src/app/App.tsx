@@ -1,8 +1,14 @@
 // ─── 主应用 ───
 
 import React, { useState, useCallback, useEffect, useRef } from "react";
-import type { PublicRoomView, PublicPlayer, PublicCause, PublicGame } from "../../../src/shared/domain.js";
-import { GameTransport } from "../transport/http.js";
+import type {
+  InteractionKind,
+  PlayerActivity,
+  PublicRoomView,
+  PublicPlayer,
+  PublicGame,
+} from "../../../src/shared/domain.js";
+import { GameTransport, type ConnectionState } from "../transport/websocket.js";
 
 const API = "/api";
 
@@ -16,6 +22,8 @@ type AppState = {
   name: string;
   roomState: PublicRoomView | null;
   error: string | null;
+  connection: ConnectionState;
+  notice: string | null;
 };
 
 
@@ -44,6 +52,8 @@ export default function App() {
     name: loadStorage()["_lastName"]?.name || "",
     roomState: null,
     error: null,
+    connection: "connecting",
+    notice: null,
   });
 
   const transportRef = useRef<GameTransport | null>(null);
@@ -80,9 +90,24 @@ export default function App() {
       saveStorage(data.roomCode, data.playerToken, name);
       saveStorage("_lastName", "", name);
 
-      const t = new GameTransport(data.roomCode, data.playerToken, {
+      const t = new GameTransport(location.origin, data.roomCode, data.playerToken, {
         onState: (s) => setState((prev) => ({ ...prev, roomState: s, phase: "in-room" })),
+        onPresence: (message) => setState((prev) => ({
+          ...prev,
+          roomState: prev.roomState ? {
+            ...prev.roomState,
+            players: prev.roomState.players.map((p) => p.id === message.playerId
+              ? { ...p, connected: message.connected, activity: message.activity }
+              : p),
+          } : null,
+        })),
+        onInteraction: (from, interaction) => setState((prev) => ({
+          ...prev,
+          notice: interactionText(prev.roomState?.players.find((p) => p.id === from)?.name, interaction),
+        })),
+        onConnection: (connection) => setState((prev) => ({ ...prev, connection })),
         onError: (code, msg) => setState((prev) => ({ ...prev, error: msg })),
+        onExpired: () => setState((prev) => ({ ...prev, error: "房间已过期", phase: "home", roomState: null })),
       });
 
       transportRef.current = t;
@@ -138,9 +163,24 @@ export default function App() {
       saveStorage(code, finalToken, name);
       saveStorage("_lastName", "", name);
 
-      const t = new GameTransport(code, finalToken, {
+      const t = new GameTransport(location.origin, code, finalToken, {
         onState: (s) => setState((prev) => ({ ...prev, roomState: s, phase: "in-room" })),
+        onPresence: (message) => setState((prev) => ({
+          ...prev,
+          roomState: prev.roomState ? {
+            ...prev.roomState,
+            players: prev.roomState.players.map((p) => p.id === message.playerId
+              ? { ...p, connected: message.connected, activity: message.activity }
+              : p),
+          } : null,
+        })),
+        onInteraction: (from, interaction) => setState((prev) => ({
+          ...prev,
+          notice: interactionText(prev.roomState?.players.find((p) => p.id === from)?.name, interaction),
+        })),
+        onConnection: (connection) => setState((prev) => ({ ...prev, connection })),
         onError: (code, msg) => setState((prev) => ({ ...prev, error: msg })),
+        onExpired: () => setState((prev) => ({ ...prev, error: "房间已过期", phase: "home", roomState: null })),
       });
 
       transportRef.current = t;
@@ -170,6 +210,14 @@ export default function App() {
     },
     [state.roomState],
   );
+
+  const sendPresence = useCallback((activity: PlayerActivity) => {
+    transportRef.current?.sendPresence(activity);
+  }, []);
+
+  const sendInteraction = useCallback((interaction: InteractionKind) => {
+    transportRef.current?.sendInteraction(interaction);
+  }, []);
 
   // ─── 返回首页 ───
 
@@ -206,9 +254,14 @@ export default function App() {
         playerId={state.playerId}
         playerName={state.name}
         sendCommand={sendCommand}
+        sendPresence={sendPresence}
+        sendInteraction={sendInteraction}
         goHome={goHome}
+        connection={state.connection}
         error={state.error}
         onClearError={() => setState((s) => ({ ...s, error: null }))}
+        notice={state.notice}
+        onClearNotice={() => setState((s) => ({ ...s, notice: null }))}
       />
     );
   }
@@ -234,6 +287,16 @@ async function hashToken(token: string): Promise<string> {
   return Array.from(new Uint8Array(hash), (b) =>
     b.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+function interactionText(name: string | undefined, interaction: InteractionKind): string {
+  const who = name || "对方";
+  switch (interaction) {
+    case "nudge": return `${who} 轻轻催了你一下 👀`;
+    case "almost": return `${who}：我真的就差一点！😤`;
+    case "nice": return `${who}：这把猜得漂亮 👏`;
+    case "rematch": return `${who}：不服，再来一局！🔥`;
+  }
 }
 
 // ─── 首页 ───
@@ -364,19 +427,28 @@ function RoomScreen({
   roomState,
   playerId,
   sendCommand,
+  sendPresence,
+  sendInteraction,
   goHome,
+  connection,
   error,
   onClearError,
+  notice,
+  onClearNotice,
 }: {
   roomState: PublicRoomView;
   playerId: string;
   playerName: string;
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  sendPresence: (activity: PlayerActivity) => void;
+  sendInteraction: (interaction: InteractionKind) => void;
   goHome: () => void;
+  connection: ConnectionState;
   error: string | null;
   onClearError: () => void;
+  notice: string | null;
+  onClearNotice: () => void;
 }) {
-  const isCreator = roomState.players[0]?.id === playerId;
   const me = roomState.players.find((p) => p.id === playerId);
   const opponent = roomState.players.find((p) => p.id !== playerId);
   const [toast, setToast] = useState<string | null>(null);
@@ -396,8 +468,10 @@ function RoomScreen({
   return (
     <div className="container">
       {/* 连接状态 */}
-      {reconnecting && (
-        <div className="connection-bar reconnecting">重新连接中…</div>
+      {connection !== "connected" && (
+        <div className="connection-bar reconnecting">
+          {connection === "connecting" ? "正在连接…" : "网络波动，正在重连…"}
+        </div>
       )}
 
       {/* 头部 */}
@@ -456,6 +530,7 @@ function RoomScreen({
           me={me}
           opponent={opponent}
           sendCommand={sendCommand}
+          sendPresence={sendPresence}
           roomState={roomState}
         />
       )}
@@ -466,6 +541,8 @@ function RoomScreen({
           opponent={opponent}
           playerId={playerId}
           sendCommand={sendCommand}
+          sendPresence={sendPresence}
+          sendInteraction={sendInteraction}
         />
       )}
       {phase === "finished" && roomState.currentGame && (
@@ -475,11 +552,13 @@ function RoomScreen({
           rematchReady={roomState.rematchReadyPlayerIds}
           playerId={playerId}
           sendCommand={sendCommand}
+          sendInteraction={sendInteraction}
           completedGames={roomState.completedGames}
         />
       )}
 
       {error && <Toast message={error} onDismiss={onClearError} />}
+      {notice && <Toast message={notice} onDismiss={onClearNotice} />}
       {toast && <div className="toast" onClick={() => setToast(null)}>{toast}</div>}
     </div>
   );
@@ -514,11 +593,13 @@ function PreparePhase({
   me,
   opponent,
   sendCommand,
+  sendPresence,
   roomState,
 }: {
   me: PublicPlayer | undefined;
   opponent: PublicPlayer | undefined;
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  sendPresence: (activity: PlayerActivity) => void;
   roomState: PublicRoomView;
 }) {
   const [secretInput, setSecretInput] = useState("");
@@ -528,15 +609,18 @@ function PreparePhase({
   const handleSecretChange = (val: string) => {
     const filtered = val.replace(/\D/g, "").slice(0, 4);
     setSecretInput(filtered);
+    sendPresence(filtered ? "typing" : "thinking");
   };
 
   const submitReady = () => {
     if (secretInput.length !== 4) return;
+    sendPresence("idle");
     sendCommand("ready.set", { secret: secretInput });
   };
 
   const cancelReady = () => {
     sendCommand("ready.unset", {} as Record<string, never>);
+    sendPresence("thinking");
     setSecretInput("");
   };
 
@@ -600,37 +684,50 @@ function PlayingPhase({
   opponent,
   playerId,
   sendCommand,
+  sendPresence,
+  sendInteraction,
 }: {
   game: PublicGame;
   me: PublicPlayer | undefined;
   opponent: PublicPlayer | undefined;
   playerId: string;
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  sendPresence: (activity: PlayerActivity) => void;
+  sendInteraction: (interaction: InteractionKind) => void;
 }) {
   const [guessInput, setGuessInput] = useState("");
   const [showMySecret, setShowMySecret] = useState(false);
   const isMyTurn = game.currentPlayerId === playerId;
+  const turnStartedAt = game.turns.at(-1)?.createdAt ?? game.startedAt;
+  const elapsed = useElapsedSeconds(turnStartedAt);
+
+  useEffect(() => {
+    sendPresence(isMyTurn ? "thinking" : "idle");
+    return () => sendPresence("idle");
+  }, [isMyTurn, sendPresence]);
 
   const handleGuessChange = (val: string) => {
-    const filtered = val.replace(/\\D/g, "").slice(0, 4);
+    const filtered = val.replace(/\D/g, "").slice(0, 4);
     setGuessInput(filtered);
+    sendPresence(filtered ? "typing" : "thinking");
   };
 
   const submitGuess = () => {
     if (guessInput.length !== 4 || !isMyTurn) return;
+    sendPresence("idle");
     sendCommand("guess.submit", { guess: guessInput });
     setGuessInput("");
   };
 
   const allTurns = game.turns;
-  const rounds = groupTurnsIntoRounds(allTurns, game.firstPlayerId);
-  const myTurns = allTurns.filter(t => t.playerId === playerId);
+  const rounds = groupTurnsIntoRounds(allTurns);
+  const currentRound = Math.floor(allTurns.length / 2) + 1;
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 10 }}>
       <div style={{ textAlign: "center" }}>
         <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
-          第 {game.gameNumber} 局 · 第 {rounds.length + 1} 轮
+          第 {game.gameNumber} 局 · 第 {currentRound} 轮
         </span>
       </div>
 
@@ -651,9 +748,19 @@ function PlayingPhase({
         {isMyTurn ? (
           <span style={{ color: "var(--accent-1)" }}>轮到你猜了</span>
         ) : (
-          <span style={{ color: "var(--text-dim)" }}>等待对方猜测…</span>
+          <span style={{ color: "var(--text-dim)" }}>
+            {opponent?.activity === "typing"
+              ? `${opponent.name} 正在输入…`
+              : `等待 ${opponent?.name || "对方"}猜测 · ${elapsed}s`}
+          </span>
         )}
       </div>
+
+      {!isMyTurn && elapsed >= 10 && (
+        <button className="btn btn-secondary nudge-button" onClick={() => sendInteraction("nudge")}>
+          👀 轻轻催一下
+        </button>
+      )}
 
       {isMyTurn && (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, width: "100%", maxWidth: 300, margin: "0 auto" }}>
@@ -697,7 +804,6 @@ function PlayingPhase({
 
 function groupTurnsIntoRounds(
   turns: NonNullable<PublicRoomView["currentGame"]>["turns"],
-  firstPlayerId: string,
 ) {
   const results: { ro: number; turns: typeof turns }[] = [];
   let ro = 1;
@@ -728,6 +834,31 @@ function hitsText(hits: number): string {
   }
 }
 
+function useElapsedSeconds(startedAt: number): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [startedAt]);
+  return Math.max(0, Math.floor((now - startedAt) / 1_000));
+}
+
+function guessInsight(game: PublicGame, playerId: string): { text: string; interaction: InteractionKind } {
+  const guesses = game.turns.filter((turn) => turn.playerId === playerId);
+  if (game.winnerPlayerId === playerId) {
+    return { text: `你用了 ${guesses.length} 次猜中，对方最后还是被你拆穿了。`, interaction: "nice" };
+  }
+  const best = guesses.reduce((current, turn) => turn.hits > current.hits ? turn : current, guesses[0] ?? { hits: 0, guess: "" });
+  if (best.hits === 3) {
+    return { text: `你猜 ${best.guess} 时已经命中 3 位——真的就差一点。`, interaction: "almost" };
+  }
+  if (best.hits === 2) {
+    return { text: `你最好的一次是 ${best.guess}，已经锁定了一半位置。`, interaction: "almost" };
+  }
+  return { text: guesses.length ? "这局线索藏得很深，下一局换个起手也许就破了。" : "还没来得及出手，下一局把机会抢回来。", interaction: "rematch" };
+}
+
 // ─── 结算阶段 ───
 
 function FinishedPhase({
@@ -736,6 +867,7 @@ function FinishedPhase({
   rematchReady,
   playerId,
   sendCommand,
+  sendInteraction,
   completedGames,
 }: {
   game: NonNullable<PublicRoomView["currentGame"]>;
@@ -743,6 +875,7 @@ function FinishedPhase({
   rematchReady: string[];
   playerId: string;
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  sendInteraction: (interaction: InteractionKind) => void;
   completedGames: PublicRoomView["completedGames"];
 }) {
   const winner = players.find((p) => p.id === game.winnerPlayerId);
@@ -752,6 +885,7 @@ function FinishedPhase({
 
   const myGuesses = game.turns.filter((t) => t.playerId === playerId).length;
   const oppGuesses = game.turns.filter((t) => t.playerId !== playerId).length;
+  const insight = guessInsight(game, playerId);
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
@@ -763,6 +897,14 @@ function FinishedPhase({
         <p style={{ fontSize: 13, color: "var(--text-dim)", margin: 0 }}>
           我猜了 {myGuesses} 次 · 对手猜了 {oppGuesses} 次
         </p>
+      </div>
+
+      <div className="insight-card">
+        <div className="insight-label">这局复盘</div>
+        <div>{insight.text}</div>
+        <button className="reaction-chip" onClick={() => sendInteraction(insight.interaction)}>
+          {insight.interaction === "almost" ? "发给对方：我就差一点 😤" : "把这句发给对方"}
+        </button>
       </div>
 
       {/* 公开秘密 */}
@@ -783,7 +925,10 @@ function FinishedPhase({
           <button
             className="btn btn-primary"
             style={{ minWidth: 200 }}
-            onClick={() => sendCommand("rematch.set", { ready: true })}
+            onClick={() => {
+              sendCommand("rematch.set", { ready: true });
+              sendInteraction("rematch");
+            }}
           >
             再来一局
           </button>
@@ -838,6 +983,9 @@ function PlayerSeat({
   isCurrentTurn: boolean;
 }) {
   const statusText = () => {
+    if (!player.connected) return "暂时离开";
+    if (player.activity === "typing") return "正在输入";
+    if (player.activity === "thinking") return "正在思考";
     if (phase === "preparing" && player.ready) return "已准备";
     if (phase === "playing" && isCurrentTurn) return "思考中";
     if (phase === "playing") return "等待中";
@@ -851,6 +999,7 @@ function PlayerSeat({
         borderColor: isCurrentTurn ? "var(--accent-1)" : "var(--border)",
       }}
     >
+      <span className={`dot ${player.connected ? "online" : "offline"}`} />
       <span className="name" style={{ fontSize: 13 }}>
         {player.name}
         {isMe ? " (你)" : ""}

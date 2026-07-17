@@ -1,6 +1,11 @@
 // ─── WebSocket 消息协议 ───
 
-import type { PublicRoomView, PublicCause } from "./domain.js";
+import type {
+  PublicRoomView,
+  PublicCause,
+  PlayerActivity,
+  InteractionKind,
+} from "./domain.js";
 
 export type DomainErrorCode =
   | "INVALID_INPUT"
@@ -33,6 +38,25 @@ export type GuessSubmit = ClientCommand<"guess.submit", { guess: string }>;
 export type RematchSet = ClientCommand<"rematch.set", { ready: boolean }>;
 export type StateRequest = ClientCommand<"state.request", Record<string, never>>;
 
+export type PresenceUpdate = {
+  type: "presence.update";
+  activity: PlayerActivity;
+};
+
+export type InteractionSend = {
+  type: "interaction.send";
+  interaction: InteractionKind;
+};
+
+export type ClientMessage =
+  | ReadySet
+  | ReadyUnset
+  | GuessSubmit
+  | RematchSet
+  | StateRequest
+  | PresenceUpdate
+  | InteractionSend;
+
 // ─── 服务端消息 ───
 
 export type RoomSnapshot = {
@@ -60,8 +84,24 @@ export type CommandError = {
   currentVersion: number;
 };
 
+export type PresenceUpdated = {
+  type: "presence.updated";
+  playerId: string;
+  connected: boolean;
+  activity: PlayerActivity;
+};
+
+export type InteractionReceived = {
+  type: "interaction.received";
+  fromPlayerId: string;
+  interaction: InteractionKind;
+  createdAt: number;
+};
+
 export type ServerMessage =
   | RoomSnapshot
   | RoomUpdated
   | RoomExpired
-  | CommandError;
+  | CommandError
+  | PresenceUpdated
+  | InteractionReceived;

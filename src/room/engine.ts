@@ -8,6 +8,7 @@ import type {
   RoomPhase,
 } from "../shared/domain.js";
 import { DomainError } from "../shared/validation.js";
+import { isValidGuess } from "../shared/validation.js";
 
 // ─── 命中计算 ───
 
@@ -103,16 +104,14 @@ function markProcessed(state: RoomState, commandId: string, playerId: string): R
     ...state.processedCommands,
     { commandId, playerId, resultingVersion: state.version },
   ];
-  // 每名玩家最多保留 32 条
-  const byPlayer = new Map<string, typeof cmds>();
-  for (const c of cmds) {
-    const list = byPlayer.get(c.playerId) || [];
-    list.push(c);
-    byPlayer.set(c.playerId, list);
-  }
+  // 每名玩家最多保留 32 条。
+  const kept = cmds.filter((command, index, all) => {
+    const laterForPlayer = all.slice(index + 1).filter((c) => c.playerId === command.playerId).length;
+    return laterForPlayer < 32;
+  });
   return {
     ...state,
-    processedCommands: cmds.slice(-64), // 容错剪裁
+    processedCommands: kept,
   };
 }
 
@@ -126,6 +125,10 @@ export function readySet(
   now: number,
 ): { state: RoomState } {
   if (isAlreadyProcessed(state, commandId, playerId)) return { state };
+
+  if (!isValidGuess(secret)) {
+    throw new DomainError("INVALID_SECRET", "密码必须是四位数字");
+  }
 
   if (state.phase !== "preparing") {
     throw new DomainError("WRONG_PHASE", "当前阶段不允许准备");
@@ -194,13 +197,16 @@ function startGame(state: RoomState, now: number): RoomState {
   if (players.length !== 2) throw new DomainError("COMMAND_REJECTED", "需要两名玩家");
 
   // 先手：第一局随机；后续输家先手
+  const randomSeat = new Uint8Array(1);
+  crypto.getRandomValues(randomSeat);
   const firstPlayerId =
     state.previousLoserId && players.some((p) => p.id === state.previousLoserId)
       ? state.previousLoserId
-      : players[Math.random() < 0.5 ? 0 : 1]!.id;
+      : players[randomSeat[0]! % 2]!.id;
 
-  const gameNumber = state.totalGamesPlayed + 1;
-  const nextTotal = state.totalGamesPlayed + 1;
+  const totalGamesPlayed = state.totalGamesPlayed ?? state.completedGames.length;
+  const gameNumber = totalGamesPlayed + 1;
+  const nextTotal = gameNumber;
 
   const game: Game = {
     gameNumber,
@@ -231,8 +237,14 @@ export function submitGuess(
   commandId: string,
   expectedVersion: number,
   now: number,
-): { state: RoomState; hitResult: { hits: 0 | 1 | 2 | 3 | 4; won: boolean } } {
-  if (isAlreadyProcessed(state, commandId, playerId)) return { state, hitResult: { hits: 0, won: false } };
+): { state: RoomState; hitResult: { hits: 0 | 1 | 2 | 3 | 4; won: boolean } | null; duplicate: boolean } {
+  if (isAlreadyProcessed(state, commandId, playerId)) {
+    return { state, hitResult: null, duplicate: true };
+  }
+
+  if (!isValidGuess(guess)) {
+    throw new DomainError("INVALID_GUESS", "猜测必须是四位数字");
+  }
 
   if (state.phase !== "playing") {
     throw new DomainError("WRONG_PHASE", "游戏未在进行中");
@@ -289,7 +301,7 @@ export function submitGuess(
   }
 
   newState = markProcessed(newState, commandId, playerId);
-  return { state: newState, hitResult: { hits, won } };
+  return { state: newState, hitResult: { hits, won }, duplicate: false };
 }
 
 // ─── 再来一局 ───

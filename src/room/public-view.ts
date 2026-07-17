@@ -2,7 +2,7 @@
 
 import type { RoomState, PublicRoomView, PublicPlayer, PublicGame } from "../shared/domain.js";
 
-type PresenceMap = Map<string, boolean>;
+type PresenceMap = Map<string, { connected: boolean; activity: PublicPlayer["activity"] }>;
 
 export function toPublicRoomView(
   state: RoomState,
@@ -16,7 +16,8 @@ export function toPublicRoomView(
     seat: p.seat,
     name: p.name,
     ready: p.ready,
-    connected: presence.get(p.id) ?? false,
+    connected: presence.get(p.id)?.connected ?? false,
+    activity: presence.get(p.id)?.activity ?? "idle",
     // 游戏结束前只展示自己的 secret
     secret: gameEnded || p.id === viewerPlayerId ? p.secret : null,
   }));
