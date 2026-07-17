@@ -1,0 +1,1003 @@
+// ─── 主应用 ───
+
+import React, { useState, useCallback, useEffect, useRef } from "react";
+import type { PublicRoomView, PublicPlayer, PublicCause } from "../../../src/shared/domain.js";
+import type { ServerMessage } from "../../../src/shared/protocol.js";
+import { GameTransport } from "../transport/websocket.js";
+
+type AppPhase = "home" | "creating" | "joining" | "in-room";
+
+type AppState = {
+  phase: AppPhase;
+  roomCode: string;
+  playerToken: string;
+  playerId: string;
+  name: string;
+  roomState: PublicRoomView | null;
+  error: string | null;
+  lastCause: PublicCause | null;
+  reconnecting: boolean;
+};
+
+const API = "/api";
+
+// ─── 从 localStorage 恢复 ───
+
+function loadStorage(): Record<string, { token: string; name: string }> {
+  try {
+    return JSON.parse(localStorage.getItem("digital-bomb-players") || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveStorage(roomCode: string, token: string, name: string) {
+  const data = loadStorage();
+  data[roomCode] = { token, name };
+  localStorage.setItem("digital-bomb-players", JSON.stringify(data));
+}
+
+export default function App() {
+  const [state, setState] = useState<AppState>({
+    phase: "home",
+    roomCode: "",
+    playerToken: "",
+    playerId: "",
+    name: loadStorage()["_lastName"]?.name || "",
+    roomState: null,
+    error: null,
+    lastCause: null,
+    reconnecting: false,
+  });
+
+  const transportRef = useRef<GameTransport | null>(null);
+
+  // ─── 处理服务端消息 ───
+
+  const handleMessage = useCallback((msg: ServerMessage) => {
+    switch (msg.type) {
+      case "room.snapshot":
+        setState((s) => ({
+          ...s,
+          roomState: msg.state,
+          reconnecting: false,
+          phase: "in-room",
+        }));
+        break;
+      case "room.updated":
+        setState((s) => ({
+          ...s,
+          roomState: msg.state,
+          lastCause: msg.cause,
+          reconnecting: false,
+        }));
+        break;
+      case "room.expired":
+        setState((s) => ({
+          ...s,
+          phase: "home",
+          roomState: null,
+          error: "房间已过期",
+        }));
+        break;
+      case "command.error":
+        setState((s) => ({
+          ...s,
+          error: msg.message,
+        }));
+        break;
+    }
+  }, []);
+
+  // ─── 创建房间 ───
+
+  const createRoom = useCallback(async () => {
+    setState((s) => ({ ...s, phase: "creating", error: null }));
+
+    const name = state.name || "玩家";
+    try {
+      const resp = await fetch(`${API}/rooms`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const data = (await resp.json()) as {
+        roomCode: string;
+        playerToken: string;
+        playerId: string;
+        roomUrl?: string;
+        error?: { code: string; message: string };
+      };
+
+      if (data.error) {
+        setState((s) => ({ ...s, error: data.error!.message, phase: "home" }));
+        return;
+      }
+
+      saveStorage(data.roomCode, data.playerToken, name);
+      saveStorage("_lastName", "", name);
+
+      const t = new GameTransport(location.origin, data.roomCode, data.playerToken, {
+        onSnapshot: (msg) => handleMessage(msg),
+        onUpdated: (msg) => handleMessage(msg),
+        onExpired: () => handleMessage({ type: "room.expired" }),
+        onError: (msg) => handleMessage(msg),
+        onClose: () => setState((s) => ({ ...s, reconnecting: true })),
+      });
+
+      transportRef.current = t;
+
+      setState((s) => ({
+        ...s,
+        phase: "in-room",
+        roomCode: data.roomCode,
+        playerToken: data.playerToken,
+        playerId: data.playerId,
+      }));
+
+      await t.connect();
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        error: "创建房间失败，请重试",
+        phase: "home",
+      }));
+    }
+  }, [state.name, handleMessage]);
+
+  // ─── 加入房间 ───
+
+  const joinRoom = useCallback(async (code: string, name: string) => {
+    setState((s) => ({ ...s, phase: "joining", error: null }));
+
+    const storage = loadStorage();
+    const saved = storage[code];
+
+    try {
+      const resp = await fetch(`${API}/rooms/${code}/join`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          tokenHash: saved ? await hashToken(saved.token) : "",
+        }),
+      });
+      const data = (await resp.json()) as {
+        playerId: string;
+        playerToken: string;
+        roomState: PublicRoomView;
+        error?: { code: string; message: string };
+      };
+
+      if (data.error) {
+        setState((s) => ({ ...s, error: data.error!.message, phase: "home" }));
+        return;
+      }
+
+      const finalToken = saved?.token || data.playerToken;
+      saveStorage(code, finalToken, name);
+      saveStorage("_lastName", "", name);
+
+      const t = new GameTransport(location.origin, code, finalToken, {
+        onSnapshot: (msg) => handleMessage(msg),
+        onUpdated: (msg) => handleMessage(msg),
+        onExpired: () => handleMessage({ type: "room.expired" }),
+        onError: (msg) => handleMessage(msg),
+        onClose: () => setState((s) => ({ ...s, reconnecting: true })),
+      });
+
+      transportRef.current = t;
+
+      setState((s) => ({
+        ...s,
+        phase: "in-room",
+        roomCode: code,
+        playerToken: finalToken,
+        playerId: data.playerId || data.roomState.players.find(
+          (p) => p.name === name,
+        )?.id || "",
+      }));
+
+      await t.connect();
+    } catch {
+      setState((s) => ({ ...s, error: "加入失败，检查房间码", phase: "home" }));
+    }
+  }, [handleMessage]);
+
+  // ─── 发送命令 ───
+
+  const sendCommand = useCallback(
+    <T extends string, P>(type: T, payload: P) => {
+      if (!state.roomState) return;
+      transportRef.current?.send({
+        type,
+        commandId: crypto.randomUUID(),
+        expectedVersion: state.roomState.version,
+        payload,
+      });
+    },
+    [state.roomState],
+  );
+
+  // ─── 返回首页 ───
+
+  const goHome = useCallback(() => {
+    transportRef.current?.disconnect();
+    transportRef.current = null;
+    setState((s) => ({
+      ...s,
+      phase: "home",
+      roomCode: "",
+      roomState: null,
+      error: null,
+    }));
+  }, []);
+
+  // ─── 从 URL 检测房间码 ───
+
+  useEffect(() => {
+    const match = location.pathname.match(/^\/r\/([A-HJ-NP-Z2-9]{6})$/i);
+    if (match && state.phase === "home") {
+      const code = match[1]!.toUpperCase();
+      joinRoom(code, state.name || "玩家");
+    }
+  }, [state.phase, state.name, joinRoom]);
+
+  // ─── 前台恢复 ───
+
+  useEffect(() => {
+    const onVisible = () => {
+      if (state.reconnecting && transportRef.current) {
+        transportRef.current.connect();
+      }
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) onVisible();
+    });
+    window.addEventListener("online", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", () => {});
+      window.removeEventListener("online", onVisible);
+    };
+  }, [state.reconnecting]);
+
+  // ─── 渲染 ───
+
+  if (state.phase === "in-room" && state.roomState) {
+    return (
+      <RoomScreen
+        roomState={state.roomState}
+        playerId={state.playerId}
+        playerName={state.name}
+        sendCommand={sendCommand}
+        goHome={goHome}
+        reconnecting={state.reconnecting}
+        error={state.error}
+        lastCause={state.lastCause}
+        onClearError={() => setState((s) => ({ ...s, error: null }))}
+      />
+    );
+  }
+
+  return (
+    <HomeScreen
+      name={state.name}
+      setName={(n) => setState((s) => ({ ...s, name: n }))}
+      onCreate={createRoom}
+      onJoin={(code) => joinRoom(code, state.name || "玩家")}
+      loading={state.phase !== "home"}
+      error={state.error}
+      onClearError={() => setState((s) => ({ ...s, error: null }))}
+    />
+  );
+}
+
+// ─── 简单 hash helper ───
+
+async function hashToken(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+// ─── 首页 ───
+
+function HomeScreen({
+  name,
+  setName,
+  onCreate,
+  onJoin,
+  loading,
+  error,
+  onClearError,
+}: {
+  name: string;
+  setName: (n: string) => void;
+  onCreate: () => void;
+  onJoin: (code: string) => void;
+  loading: boolean;
+  error: string | null;
+  onClearError: () => void;
+}) {
+  const [codeInput, setCodeInput] = useState("");
+  const [showJoin, setShowJoin] = useState(false);
+
+  return (
+    <div className="container" style={{ justifyContent: "center" }}>
+      <div className="header">
+        <h1>💣 数字炸弹</h1>
+        <p className="subtitle">猜中数字和位置，先找出对方的四位密码</p>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div>
+          <label
+            style={{
+              display: "block",
+              fontSize: 13,
+              color: "var(--text-dim)",
+              marginBottom: 6,
+            }}
+          >
+            你的昵称
+          </label>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value.slice(0, 16))}
+            placeholder="1~16 个字符"
+            maxLength={16}
+            style={{
+              width: "100%",
+              padding: "12px 16px",
+              borderRadius: "var(--radius)",
+              border: "1px solid var(--border)",
+              background: "var(--surface)",
+              color: "var(--text)",
+              fontSize: 16,
+            }}
+          />
+        </div>
+
+        <button
+          className="btn btn-primary"
+          onClick={onCreate}
+          disabled={loading}
+        >
+          {loading ? "创建中…" : "创建房间"}
+        </button>
+
+        {!showJoin ? (
+          <button
+            className="btn btn-secondary"
+            onClick={() => setShowJoin(true)}
+          >
+            输入房间码加入
+          </button>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="text"
+                value={codeInput}
+                onChange={(e) =>
+                  setCodeInput(e.target.value.toUpperCase().slice(0, 6))
+                }
+                placeholder="6 位房间码"
+                maxLength={6}
+                style={{
+                  flex: 1,
+                  padding: "12px 16px",
+                  borderRadius: "var(--radius)",
+                  border: "1px solid var(--border)",
+                  background: "var(--surface)",
+                  color: "var(--text)",
+                  fontSize: 18,
+                  letterSpacing: 4,
+                  textAlign: "center",
+                  textTransform: "uppercase",
+                }}
+              />
+              <button
+                className="btn btn-primary"
+                style={{ width: "auto", padding: "12px 20px" }}
+                onClick={() => codeInput.length === 6 && onJoin(codeInput)}
+                disabled={loading || codeInput.length !== 6}
+              >
+                加入
+              </button>
+            </div>
+            <button
+              className="btn btn-secondary"
+              onClick={() => setShowJoin(false)}
+            >
+              取消
+            </button>
+          </div>
+        )}
+      </div>
+
+      {error && <Toast message={error} onDismiss={onClearError} />}
+    </div>
+  );
+}
+
+// ─── 房间主屏幕 ───
+
+function RoomScreen({
+  roomState,
+  playerId,
+  sendCommand,
+  goHome,
+  reconnecting,
+  error,
+  lastCause,
+  onClearError,
+}: {
+  roomState: PublicRoomView;
+  playerId: string;
+  playerName: string;
+  sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  goHome: () => void;
+  reconnecting: boolean;
+  error: string | null;
+  lastCause: PublicCause | null;
+  onClearError: () => void;
+}) {
+  const isCreator = roomState.players[0]?.id === playerId;
+  const me = roomState.players.find((p) => p.id === playerId);
+  const opponent = roomState.players.find((p) => p.id !== playerId);
+
+  // 根据阶段渲染不同界面
+  const phase = roomState.phase;
+
+  const shareRoom = () => {
+    const url = `${location.origin}/r/${roomState.roomCode}`;
+    navigator.clipboard.writeText(url).catch(() => {});
+    if (navigator.share) {
+      navigator.share({ title: "数字炸弹", text: `来玩数字炸弹！房间码: ${roomState.roomCode}`, url });
+    }
+  };
+
+  return (
+    <div className="container">
+      {/* 连接状态 */}
+      {reconnecting && (
+        <div className="connection-bar reconnecting">重新连接中…</div>
+      )}
+
+      {/* 头部 */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <span style={{ fontSize: 13, color: "var(--text-dim)" }}>
+            房间 {roomState.roomCode}
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn btn-secondary" style={{ width: "auto", padding: "6px 12px", fontSize: 13 }} onClick={shareRoom}>
+            分享
+          </button>
+          <button className="btn btn-secondary" style={{ width: "auto", padding: "6px 12px", fontSize: 13 }} onClick={goHome}>
+            离开
+          </button>
+        </div>
+      </div>
+
+      {/* 玩家状态 */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {roomState.players.map((p) => (
+          <PlayerSeat
+            key={p.id}
+            player={p}
+            isMe={p.id === playerId}
+            phase={roomState.phase}
+            isCurrentTurn={
+              roomState.phase === "playing" &&
+              roomState.currentGame?.currentPlayerId === p.id
+            }
+          />
+        ))}
+        {roomState.players.length < 2 && (
+          <div className="card" style={{ textAlign: "center", color: "var(--text-dim)", padding: "24px" }}>
+            <p>等待对方加入…</p>
+            <p style={{ fontSize: 13, marginTop: 8 }}>
+              分享房间码或链接给对方
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* 按阶段渲染 */}
+      {phase === "waiting" && <WaitingPhase roomCode={roomState.roomCode} onShare={shareRoom} />}
+      {phase === "preparing" && (
+        <PreparePhase
+          me={me}
+          opponent={opponent}
+          sendCommand={sendCommand}
+          roomState={roomState}
+        />
+      )}
+      {phase === "playing" && roomState.currentGame && (
+        <PlayingPhase
+          game={roomState.currentGame}
+          me={me}
+          opponent={opponent}
+          playerId={playerId}
+          sendCommand={sendCommand}
+          lastCause={lastCause}
+        />
+      )}
+      {phase === "finished" && roomState.currentGame && (
+        <FinishedPhase
+          game={roomState.currentGame}
+          players={roomState.players}
+          rematchReady={roomState.rematchReadyPlayerIds}
+          playerId={playerId}
+          sendCommand={sendCommand}
+          completedGames={roomState.completedGames}
+        />
+      )}
+
+      {error && <Toast message={error} onDismiss={onClearError} />}
+    </div>
+  );
+}
+
+// ─── 等待阶段 ───
+
+function WaitingPhase({ roomCode, onShare }: { roomCode: string; onShare: () => void }) {
+  return (
+    <div style={{ textAlign: "center", padding: "20px 0" }}>
+      <p style={{ color: "var(--text-dim)" }}>邀请朋友一起玩</p>
+      <div
+        style={{
+          fontSize: 48,
+          fontWeight: 700,
+          letterSpacing: 8,
+          margin: "20px 0",
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {roomCode}
+      </div>
+      <button className="btn btn-primary" onClick={onShare}>
+        📋 复制邀请链接
+      </button>
+    </div>
+  );
+}
+
+// ─── 准备阶段 ───
+
+function PreparePhase({
+  me,
+  opponent,
+  sendCommand,
+  roomState,
+}: {
+  me: PublicPlayer | undefined;
+  opponent: PublicPlayer | undefined;
+  sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  roomState: PublicRoomView;
+}) {
+  const [digits, setDigits] = useState<string[]>([]);
+  const [showSecret, setShowSecret] = useState(false);
+
+  const addDigit = (d: string) => {
+    if (digits.length >= 4) return;
+    setDigits([...digits, d]);
+  };
+
+  const delDigit = () => {
+    setDigits(digits.slice(0, -1));
+  };
+
+  const isReady = me?.ready ?? false;
+
+  const submitReady = () => {
+    if (digits.length !== 4) return;
+    sendCommand("ready.set", { secret: digits.join("") });
+  };
+
+  const cancelReady = () => {
+    sendCommand("ready.unset", {} as Record<string, never>);
+    setDigits([]);
+  };
+
+  // 上一局输家先手提示
+  const prevLoser = roomState.previousLoserId;
+  const loserName = roomState.players.find((p) => p.id === prevLoser)?.name;
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 20 }}>
+      {prevLoser && (
+        <div className="card" style={{ width: "100%", textAlign: "center", fontSize: 14, color: "var(--text-dim)" }}>
+          上一局 {loserName} 先手
+        </div>
+      )}
+
+      <p style={{ fontSize: 14, color: "var(--text-dim)" }}>
+        设置你的四位密码
+      </p>
+
+      {isReady ? (
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 18, color: "var(--success)", marginBottom: 12 }}>✓ 已准备</div>
+          <div className="secret-reveal">
+            <span>{showSecret ? (me?.secret || "****") : "****"}</span>
+            <button
+              style={{ fontSize: 13, color: "var(--text-dim)", padding: 4 }}
+              onClick={() => setShowSecret(!showSecret)}
+              onMouseDown={() => setShowSecret(true)}
+              onMouseUp={() => setShowSecret(false)}
+              onMouseLeave={() => setShowSecret(false)}
+              onTouchStart={() => setShowSecret(true)}
+              onTouchEnd={() => setShowSecret(false)}
+            >
+              {showSecret ? "👁" : "👁‍🗨"}
+            </button>
+          </div>
+          <button className="btn btn-secondary" style={{ marginTop: 12 }} onClick={cancelReady}>
+            取消准备
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="digit-slots">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className={`digit-slot ${digits[i] ? "filled" : ""}`}>
+                {digits[i] || ""}
+              </div>
+            ))}
+          </div>
+          <div className="num-pad">
+            {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((d) => (
+              <button key={d} onClick={() => addDigit(d)} disabled={digits.length >= 4}>
+                {d}
+              </button>
+            ))}
+            <div />
+            <button onClick={() => addDigit("0")} disabled={digits.length >= 4}>0</button>
+            <button className="num-del" onClick={delDigit}>⌫</button>
+          </div>
+          <button
+            className="btn btn-primary"
+            onClick={submitReady}
+            disabled={digits.length !== 4}
+            style={{ maxWidth: 280 }}
+          >
+            我准备好了
+          </button>
+        </>
+      )}
+
+      {opponent && (
+        <p style={{ fontSize: 13, color: "var(--text-dim)" }}>
+          {opponent.ready ? `${opponent.name} 已准备` : `等待 ${opponent.name} 准备…`}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ─── 游戏阶段 ───
+
+function PlayingPhase({
+  game,
+  me,
+  opponent,
+  playerId,
+  sendCommand,
+  lastCause,
+}: {
+  game: NonNullable<PublicRoomView["currentGame"]>;
+  me: PublicPlayer | undefined;
+  opponent: PublicPlayer | undefined;
+  playerId: string;
+  sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  lastCause: PublicCause | null;
+}) {
+  const [digits, setDigits] = useState<string[]>([]);
+  const [showSecret, setShowSecret] = useState(false);
+  const isMyTurn = game.currentPlayerId === playerId;
+
+  const addDigit = (d: string) => {
+    if (!isMyTurn || digits.length >= 4) return;
+    setDigits([...digits, d]);
+  };
+
+  const delDigit = () => {
+    if (!isMyTurn) return;
+    setDigits(digits.slice(0, -1));
+  };
+
+  const submitGuess = () => {
+    if (digits.length !== 4 || !isMyTurn) return;
+    sendCommand("guess.submit", { guess: digits.join("") });
+    setDigits([]);
+  };
+
+  // 计算轮次分组
+  const rounds = groupTurnsIntoRounds(game.turns, game.firstPlayerId);
+
+  const currentRound = Math.ceil(game.turns.length / 2) || 1;
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* 游戏信息 */}
+      <div style={{ textAlign: "center" }}>
+        <span style={{ fontSize: 13, color: "var(--text-dim)" }}>
+          第 {game.gameNumber} 局 · 第 {currentRound} 轮
+        </span>
+      </div>
+
+      {/* 回合指示 */}
+      <div style={{ textAlign: "center", fontSize: 15, fontWeight: 600 }}>
+        {isMyTurn ? (
+          <span style={{ color: "var(--accent-1)" }}>轮到你猜了</span>
+        ) : (
+          <span style={{ color: "var(--text-dim)" }}>
+            {opponent?.name || "对方"} 正在思考…
+          </span>
+        )}
+      </div>
+
+      {/* 我的密码 */}
+      <div className="secret-reveal">
+        <span style={{ fontSize: 16, color: "var(--text-dim)" }}>
+          我的密码: {showSecret ? (me?.secret || "****") : "****"}
+        </span>
+        <button
+          style={{ fontSize: 13, color: "var(--text-dim)" }}
+          onMouseDown={() => setShowSecret(true)}
+          onMouseUp={() => setShowSecret(false)}
+          onMouseLeave={() => setShowSecret(false)}
+          onTouchStart={() => setShowSecret(true)}
+          onTouchEnd={() => setShowSecret(false)}
+        >
+          👁
+        </button>
+      </div>
+
+      {/* 输入区 */}
+      <div className="digit-slots">
+        {[0, 1, 2, 3].map((i) => (
+          <div
+            key={i}
+            className={`digit-slot ${digits[i] ? "filled" : ""}`}
+            style={{ opacity: isMyTurn ? 1 : 0.3 }}
+          >
+            {digits[i] || ""}
+          </div>
+        ))}
+      </div>
+
+      <div className="num-pad" style={{ opacity: isMyTurn ? 1 : 0.3 }}>
+        {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((d) => (
+          <button key={d} onClick={() => addDigit(d)} disabled={!isMyTurn || digits.length >= 4}>
+            {d}
+          </button>
+        ))}
+        <div />
+        <button onClick={() => addDigit("0")} disabled={!isMyTurn || digits.length >= 4}>0</button>
+        <button className="num-del" onClick={delDigit} disabled={!isMyTurn}>⌫</button>
+      </div>
+
+      <button
+        className="btn btn-primary"
+        onClick={submitGuess}
+        disabled={!isMyTurn || digits.length !== 4}
+        style={{ maxWidth: 280, alignSelf: "center" }}
+      >
+        {digits.length === 4 ? `就猜 ${digits.join("")}` : "输入四位数字"}
+      </button>
+
+      {/* 历史记录 */}
+      <div style={{ flex: 1, overflow: "auto", marginTop: 8 }}>
+        <div className="turn-history">
+          {rounds.map((round, ri) => (
+            <div key={ri} className="round-group">
+              <div className="round-label">第 {round.ro} 轮</div>
+              {round.turns.map((t) => {
+                const p = t.playerId === me?.id ? me : opponent;
+                return (
+                  <div key={t.turnNumber} className="turn-row">
+                    <span className="player-name">{p?.name || "?"}</span>
+                    <span className="guess-num">{t.guess}</span>
+                    <span className={`hits hits-${t.hits}`}>
+                      {hitsText(t.hits)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function groupTurnsIntoRounds(
+  turns: NonNullable<PublicRoomView["currentGame"]>["turns"],
+  firstPlayerId: string,
+) {
+  const results: { ro: number; turns: typeof turns }[] = [];
+  let ro = 1;
+  let idx = 0;
+  while (idx < turns.length) {
+    const roundTurns = [];
+    roundTurns.push(turns[idx]!);
+    idx++;
+    // 如果下一 turn 是另一方，加入同一轮
+    if (idx < turns.length && turns[idx]!.playerId !== turns[idx - 1]!.playerId) {
+      roundTurns.push(turns[idx]!);
+      idx++;
+    }
+    results.push({ ro, turns: roundTurns });
+    ro++;
+  }
+  return results;
+}
+
+function hitsText(hits: number): string {
+  switch (hits) {
+    case 0: return "一个没中";
+    case 1: return "命中 1 位";
+    case 2: return "命中 2 位";
+    case 3: return "只差 1 位";
+    case 4: return "全部命中!";
+    default: return `${hits}`;
+  }
+}
+
+// ─── 结算阶段 ───
+
+function FinishedPhase({
+  game,
+  players,
+  rematchReady,
+  playerId,
+  sendCommand,
+  completedGames,
+}: {
+  game: NonNullable<PublicRoomView["currentGame"]>;
+  players: PublicPlayer[];
+  rematchReady: string[];
+  playerId: string;
+  sendCommand: <T extends string, P>(type: T, payload: P) => void;
+  completedGames: PublicRoomView["completedGames"];
+}) {
+  const winner = players.find((p) => p.id === game.winnerPlayerId);
+  const loser = players.find((p) => p.id === game.loserPlayerId);
+  const myReady = rematchReady.includes(playerId);
+  const opponentReady = rematchReady.some((id) => id !== playerId);
+
+  const myGuesses = game.turns.filter((t) => t.playerId === playerId).length;
+  const oppGuesses = game.turns.filter((t) => t.playerId !== playerId).length;
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* 结果 */}
+      <div style={{ textAlign: "center", padding: "16px 0" }}>
+        <div style={{ fontSize: 24, fontWeight: 700, color: "var(--success)", marginBottom: 8 }}>
+          🎉 {winner?.name || "?"} 赢了！
+        </div>
+        <p style={{ fontSize: 14, color: "var(--text-dim)" }}>
+          我猜了 {myGuesses} 次 · 对手猜了 {oppGuesses} 次
+        </p>
+      </div>
+
+      {/* 公开秘密 */}
+      <div style={{ display: "flex", gap: 12, justifyContent: "center" }}>
+        {players.map((p) => (
+          <div key={p.id} className="card" style={{ textAlign: "center", flex: 1, maxWidth: 180 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>{p.name}</div>
+            <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: 4, fontVariantNumeric: "tabular-nums" }}>
+              {p.secret}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 再来一局 */}
+      <div style={{ textAlign: "center" }}>
+        {!myReady ? (
+          <button
+            className="btn btn-primary"
+            style={{ maxWidth: 280 }}
+            onClick={() => sendCommand("rematch.set", { ready: true })}
+          >
+            再来一局
+          </button>
+        ) : (
+          <div>
+            <div style={{ color: "var(--success)", marginBottom: 8 }}>✓ 你已准备再来一局</div>
+            <button
+              className="btn btn-secondary"
+              style={{ maxWidth: 280 }}
+              onClick={() => sendCommand("rematch.set", { ready: false })}
+            >
+              取消
+            </button>
+          </div>
+        )}
+        {opponentReady && (
+          <p style={{ fontSize: 14, color: "var(--text-dim)", marginTop: 8 }}>
+            对方也已准备
+          </p>
+        )}
+      </div>
+
+      {/* 历史战绩 */}
+      {completedGames.length > 0 && (
+        <div style={{ overflow: "auto" }}>
+          <p style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 8 }}>历史战绩</p>
+          {completedGames.map((g) => {
+            const w = players.find((p) => p.id === g.winnerPlayerId);
+            return (
+              <div key={g.gameNumber} className="card" style={{ marginBottom: 8, padding: "12px 16px", fontSize: 14 }}>
+                第 {g.gameNumber} 局 · {w?.name || "?"} 胜 · {g.turns.length} 回合
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── 玩家座位 ───
+
+function PlayerSeat({
+  player,
+  isMe,
+  phase,
+  isCurrentTurn,
+}: {
+  player: PublicPlayer;
+  isMe: boolean;
+  phase: string;
+  isCurrentTurn: boolean;
+}) {
+  const statusText = () => {
+    if (!player.connected) return "离线";
+    if (phase === "preparing" && player.ready) return "已准备";
+    if (phase === "playing" && isCurrentTurn) return "思考中…";
+    if (phase === "playing") return "等待中";
+    return "";
+  };
+
+  return (
+    <div
+      className="player-seat"
+      style={{
+        borderColor: isCurrentTurn ? "var(--accent-1)" : "var(--border)",
+      }}
+    >
+      <div className={`dot ${player.connected ? "online" : "offline"}`} />
+      <span className="name">
+        {player.name}
+        {isMe ? "（我）" : ""}
+      </span>
+      <span className="status">{statusText()}</span>
+    </div>
+  );
+}
+
+// ─── Toast ───
+
+function Toast({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 3000);
+    return () => clearTimeout(t);
+  }, [message, onDismiss]);
+
+  return (
+    <div className="toast" onClick={onDismiss}>
+      {message}
+    </div>
+  );
+}
