@@ -383,6 +383,8 @@ function RoomScreen({
   const isCreator = roomState.players[0]?.id === playerId;
   const me = roomState.players.find((p) => p.id === playerId);
   const opponent = roomState.players.find((p) => p.id !== playerId);
+  const [toast, setToast] = useState<string | null>(null);
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 2000); };
 
   // 根据阶段渲染不同界面
   const phase = roomState.phase;
@@ -411,7 +413,7 @@ function RoomScreen({
             </span>
             <button
               style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 8px", background: "var(--surface)", borderRadius: 6, border: "1px solid var(--border)" }}
-              onClick={() => navigator.clipboard.writeText(roomState.roomCode)}
+              onClick={() => { navigator.clipboard.writeText(roomState.roomCode); showToast("房间码已复制"); }}
             >
               复制
             </button>
@@ -452,7 +454,7 @@ function RoomScreen({
       </div>
 
       {/* 按阶段渲染 */}
-      {phase === "waiting" && <WaitingPhase roomCode={roomState.roomCode} onShare={shareRoom} />}
+      {phase === "waiting" && <WaitingPhase roomCode={roomState.roomCode} onShare={shareRoom} onCopy={() => showToast("房间码已复制")} />}
       {phase === "preparing" && (
         <PreparePhase
           me={me}
@@ -483,13 +485,14 @@ function RoomScreen({
       )}
 
       {error && <Toast message={error} onDismiss={onClearError} />}
+      {toast && <div className="toast" onClick={() => setToast(null)}>{toast}</div>}
     </div>
   );
 }
 
 // ─── 等待阶段 ───
 
-function WaitingPhase({ roomCode, onShare }: { roomCode: string; onShare: () => void }) {
+function WaitingPhase({ roomCode, onShare, onCopy }: { roomCode: string; onShare: () => void; onCopy?: () => void }) {
   return (
     <div style={{ textAlign: "center", padding: "12px 0" }}>
       <p style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 8 }}>房间码</p>
@@ -497,7 +500,7 @@ function WaitingPhase({ roomCode, onShare }: { roomCode: string; onShare: () => 
         <p style={{ fontSize: 32, fontWeight: 700, letterSpacing: 4, color: "var(--text)", margin: 0 }}>{roomCode}</p>
         <button
           style={{ fontSize: 12, color: "var(--text-dim)", padding: "4px 10px", background: "var(--surface)", borderRadius: 6, border: "1px solid var(--border)" }}
-          onClick={() => navigator.clipboard.writeText(roomCode)}
+          onClick={() => { navigator.clipboard.writeText(roomCode); if (onCopy) onCopy(); }}
         >
           复制
         </button>
@@ -828,9 +831,8 @@ function PlayerSeat({
   isCurrentTurn: boolean;
 }) {
   const statusText = () => {
-    if (!player.connected) return "离线";
     if (phase === "preparing" && player.ready) return "已准备";
-    if (phase === "playing" && isCurrentTurn) return "思考中…";
+    if (phase === "playing" && isCurrentTurn) return "思考中";
     if (phase === "playing") return "等待中";
     return "";
   };
@@ -842,12 +844,15 @@ function PlayerSeat({
         borderColor: isCurrentTurn ? "var(--accent-1)" : "var(--border)",
       }}
     >
-      <div className={`dot ${player.connected ? "online" : "offline"}`} />
-      <span className="name">
+      <span className="name" style={{ fontSize: 13 }}>
         {player.name}
-        {isMe ? "（我）" : ""}
+        {isMe ? " (你)" : ""}
       </span>
-      <span className="status">{statusText()}</span>
+      {statusText() && (
+        <span className="status" style={{ fontSize: 11, color: player.ready ? "var(--success)" : "var(--text-dim)" }}>
+          {statusText()}
+        </span>
+      )}
     </div>
   );
 }
