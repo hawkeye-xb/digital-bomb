@@ -311,7 +311,7 @@ function HomeScreen({
             输入房间码加入
           </button>
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
             <div style={{ display: "flex", gap: 8 }}>
               <input
                 type="text"
@@ -405,9 +405,17 @@ function RoomScreen({
       {/* 头部 */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div>
-          <span style={{ fontSize: 13, color: "var(--text-dim)" }}>
-            房间 {roomState.roomCode}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 15, fontWeight: 700, color: "var(--text)", letterSpacing: 1 }}>
+              {roomState.roomCode}
+            </span>
+            <button
+              style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 8px", background: "var(--surface)", borderRadius: 6, border: "1px solid var(--border)" }}
+              onClick={() => navigator.clipboard.writeText(roomState.roomCode)}
+            >
+              复制
+            </button>
+          </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn btn-secondary" style={{ width: "auto", padding: "6px 12px", fontSize: 13 }} onClick={shareRoom}>
@@ -420,7 +428,7 @@ function RoomScreen({
       </div>
 
       {/* 玩家状态 */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
         {roomState.players.map((p) => (
           <PlayerSeat
             key={p.id}
@@ -483,21 +491,20 @@ function RoomScreen({
 
 function WaitingPhase({ roomCode, onShare }: { roomCode: string; onShare: () => void }) {
   return (
-    <div style={{ textAlign: "center", padding: "20px 0" }}>
-      <p style={{ color: "var(--text-dim)" }}>邀请朋友一起玩</p>
-      <div
-        style={{
-          fontSize: 48,
-          fontWeight: 700,
-          letterSpacing: 8,
-          margin: "20px 0",
-          fontVariantNumeric: "tabular-nums",
-        }}
-      >
-        {roomCode}
+    <div style={{ textAlign: "center", padding: "12px 0" }}>
+      <p style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 8 }}>房间码</p>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+        <p style={{ fontSize: 32, fontWeight: 700, letterSpacing: 4, color: "var(--text)", margin: 0 }}>{roomCode}</p>
+        <button
+          style={{ fontSize: 12, color: "var(--text-dim)", padding: "4px 10px", background: "var(--surface)", borderRadius: 6, border: "1px solid var(--border)" }}
+          onClick={() => navigator.clipboard.writeText(roomCode)}
+        >
+          复制
+        </button>
       </div>
-      <button className="btn btn-primary" onClick={onShare}>
-        📋 复制邀请链接
+      <p style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 10 }}>把这串码发给朋友</p>
+      <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={onShare}>
+        复制邀请链接
       </button>
     </div>
   );
@@ -516,99 +523,70 @@ function PreparePhase({
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
   roomState: PublicRoomView;
 }) {
-  const [digits, setDigits] = useState<string[]>([]);
+  const [secretInput, setSecretInput] = useState("");
   const [showSecret, setShowSecret] = useState(false);
-
-  const addDigit = (d: string) => {
-    if (digits.length >= 4) return;
-    setDigits([...digits, d]);
-  };
-
-  const delDigit = () => {
-    setDigits(digits.slice(0, -1));
-  };
-
   const isReady = me?.ready ?? false;
 
+  const handleSecretChange = (val: string) => {
+    const filtered = val.replace(/\D/g, "").slice(0, 4);
+    setSecretInput(filtered);
+  };
+
   const submitReady = () => {
-    if (digits.length !== 4) return;
-    sendCommand("ready.set", { secret: digits.join("") });
+    if (secretInput.length !== 4) return;
+    sendCommand("ready.set", { secret: secretInput });
   };
 
   const cancelReady = () => {
     sendCommand("ready.unset", {} as Record<string, never>);
-    setDigits([]);
+    setSecretInput("");
   };
 
-  // 上一局输家先手提示
   const prevLoser = roomState.previousLoserId;
   const loserName = roomState.players.find((p) => p.id === prevLoser)?.name;
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 20 }}>
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
       {prevLoser && (
-        <div className="card" style={{ width: "100%", textAlign: "center", fontSize: 14, color: "var(--text-dim)" }}>
+        <div className="card" style={{ width: "100%", textAlign: "center", fontSize: 13, color: "var(--text-dim)", padding: "8px 12px" }}>
           上一局 {loserName} 先手
         </div>
       )}
 
-      <p style={{ fontSize: 14, color: "var(--text-dim)" }}>
-        设置你的四位密码
-      </p>
+      <p style={{ fontSize: 13, color: "var(--text-dim)", margin: 0 }}>设置你的四位密码</p>
 
       {isReady ? (
         <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 18, color: "var(--success)", marginBottom: 12 }}>✓ 已准备</div>
-          <div className="secret-reveal">
-            <span>{showSecret ? (me?.secret || "****") : "****"}</span>
-            <button
-              style={{ fontSize: 13, color: "var(--text-dim)", padding: 4 }}
-              onClick={() => setShowSecret(!showSecret)}
-              onMouseDown={() => setShowSecret(true)}
-              onMouseUp={() => setShowSecret(false)}
-              onMouseLeave={() => setShowSecret(false)}
-              onTouchStart={() => setShowSecret(true)}
-              onTouchEnd={() => setShowSecret(false)}
-            >
-              {showSecret ? "👁" : "👁‍🗨"}
-            </button>
+          <div style={{ fontSize: 18, color: "var(--success)", fontWeight: 600 }}>已准备</div>
+          <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: 6, margin: "4px 0 8px" }}>
+            {showSecret ? (me?.secret || "****") : "****"}
           </div>
-          <button className="btn btn-secondary" style={{ marginTop: 12 }} onClick={cancelReady}>
+          <button
+            style={{ fontSize: 12, color: "var(--text-dim)", padding: "2px 8px", background: "var(--surface)", borderRadius: 6, border: "1px solid var(--border)" }}
+            onClick={() => setShowSecret(!showSecret)}
+          >
+            {showSecret ? "隐藏" : "显示"}
+          </button>
+          <button className="btn btn-secondary" style={{ maxWidth: 280, margin: "12px auto 0" }} onClick={cancelReady}>
             取消准备
           </button>
         </div>
       ) : (
-        <>
-          <div className="digit-slots">
-            {[0, 1, 2, 3].map((i) => (
-              <div key={i} className={`digit-slot ${digits[i] ? "filled" : ""}`}>
-                {digits[i] || ""}
-              </div>
-            ))}
-          </div>
-          <div className="num-pad">
-            {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((d) => (
-              <button key={d} onClick={() => addDigit(d)} disabled={digits.length >= 4}>
-                {d}
-              </button>
-            ))}
-            <div />
-            <button onClick={() => addDigit("0")} disabled={digits.length >= 4}>0</button>
-            <button className="num-del" onClick={delDigit}>⌫</button>
-          </div>
-          <button
-            className="btn btn-primary"
-            onClick={submitReady}
-            disabled={digits.length !== 4}
-            style={{ maxWidth: 280 }}
-          >
-            我准备好了
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14, width: "100%", maxWidth: 300 }}>
+          <input
+            type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4}
+            value={secretInput} onChange={(e) => handleSecretChange(e.target.value)}
+            placeholder="输入 4 位密码" autoFocus
+            className="digit-input"
+          />
+          <button className="btn btn-primary" onClick={submitReady} disabled={secretInput.length !== 4} style={{ width: "100%" }}>
+            {secretInput.length === 4 ? `密码 ${secretInput}` : `还需 ${4 - secretInput.length} 位`}
           </button>
-        </>
+        </div>
       )}
 
       {opponent && (
-        <p style={{ fontSize: 13, color: "var(--text-dim)" }}>
+        <p style={{ fontSize: 12, color: "var(--text-dim)", margin: 0 }}>
           {opponent.ready ? `${opponent.name} 已准备` : `等待 ${opponent.name} 准备…`}
         </p>
       )}
@@ -624,132 +602,71 @@ function PlayingPhase({
   opponent,
   playerId,
   sendCommand,
-  lastCause,
 }: {
-  game: NonNullable<PublicRoomView["currentGame"]>;
+  game: PublicGame;
   me: PublicPlayer | undefined;
   opponent: PublicPlayer | undefined;
   playerId: string;
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
-  lastCause: PublicCause | null;
 }) {
-  const [digits, setDigits] = useState<string[]>([]);
-  const [showSecret, setShowSecret] = useState(false);
+  const [guessInput, setGuessInput] = useState("");
   const isMyTurn = game.currentPlayerId === playerId;
 
-  const addDigit = (d: string) => {
-    if (!isMyTurn || digits.length >= 4) return;
-    setDigits([...digits, d]);
-  };
-
-  const delDigit = () => {
-    if (!isMyTurn) return;
-    setDigits(digits.slice(0, -1));
+  const handleGuessChange = (val: string) => {
+    const filtered = val.replace(/\D/g, "").slice(0, 4);
+    setGuessInput(filtered);
   };
 
   const submitGuess = () => {
-    if (digits.length !== 4 || !isMyTurn) return;
-    sendCommand("guess.submit", { guess: digits.join("") });
-    setDigits([]);
+    if (guessInput.length !== 4 || !isMyTurn) return;
+    sendCommand("guess.submit", { guess: guessInput });
+    setGuessInput("");
   };
 
-  // 计算轮次分组
-  const rounds = groupTurnsIntoRounds(game.turns, game.firstPlayerId);
-
-  const currentRound = Math.ceil(game.turns.length / 2) || 1;
+  const myTurns = game.turns.filter(t => t.playerId === playerId);
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* 游戏信息 */}
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ textAlign: "center" }}>
-        <span style={{ fontSize: 13, color: "var(--text-dim)" }}>
-          第 {game.gameNumber} 局 · 第 {currentRound} 轮
+        <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
+          第 {game.gameNumber} 局 · 第 {myTurns.length + 1} 轮
         </span>
       </div>
 
-      {/* 回合指示 */}
-      <div style={{ textAlign: "center", fontSize: 15, fontWeight: 600 }}>
+      <div style={{ textAlign: "center", fontSize: 16, fontWeight: 600 }}>
         {isMyTurn ? (
           <span style={{ color: "var(--accent-1)" }}>轮到你猜了</span>
         ) : (
-          <span style={{ color: "var(--text-dim)" }}>
-            {opponent?.name || "对方"} 正在思考…
-          </span>
+          <span style={{ color: "var(--text-dim)" }}>等待对方猜测…</span>
         )}
       </div>
 
-      {/* 我的密码 */}
-      <div className="secret-reveal">
-        <span style={{ fontSize: 16, color: "var(--text-dim)" }}>
-          我的密码: {showSecret ? (me?.secret || "****") : "****"}
-        </span>
-        <button
-          style={{ fontSize: 13, color: "var(--text-dim)" }}
-          onMouseDown={() => setShowSecret(true)}
-          onMouseUp={() => setShowSecret(false)}
-          onMouseLeave={() => setShowSecret(false)}
-          onTouchStart={() => setShowSecret(true)}
-          onTouchEnd={() => setShowSecret(false)}
-        >
-          👁
-        </button>
-      </div>
-
-      {/* 输入区 */}
-      <div className="digit-slots">
-        {[0, 1, 2, 3].map((i) => (
-          <div
-            key={i}
-            className={`digit-slot ${digits[i] ? "filled" : ""}`}
-            style={{ opacity: isMyTurn ? 1 : 0.3 }}
-          >
-            {digits[i] || ""}
-          </div>
-        ))}
-      </div>
-
-      <div className="num-pad" style={{ opacity: isMyTurn ? 1 : 0.3 }}>
-        {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((d) => (
-          <button key={d} onClick={() => addDigit(d)} disabled={!isMyTurn || digits.length >= 4}>
-            {d}
+      {isMyTurn && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, width: "100%", maxWidth: 300, margin: "0 auto" }}>
+          <input
+            type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4}
+            value={guessInput} onChange={(e) => handleGuessChange(e.target.value)}
+            placeholder="输入 4 位数字" autoFocus
+            className="digit-input"
+          />
+          <button className="btn btn-primary" onClick={submitGuess} disabled={guessInput.length !== 4} style={{ width: "100%" }}>
+            {guessInput.length === 4 ? `就猜 ${guessInput}` : `${4 - guessInput.length} 位待输入`}
           </button>
-        ))}
-        <div />
-        <button onClick={() => addDigit("0")} disabled={!isMyTurn || digits.length >= 4}>0</button>
-        <button className="num-del" onClick={delDigit} disabled={!isMyTurn}>⌫</button>
-      </div>
-
-      <button
-        className="btn btn-primary"
-        onClick={submitGuess}
-        disabled={!isMyTurn || digits.length !== 4}
-        style={{ maxWidth: 280, alignSelf: "center" }}
-      >
-        {digits.length === 4 ? `就猜 ${digits.join("")}` : "输入四位数字"}
-      </button>
-
-      {/* 历史记录 */}
-      <div style={{ flex: 1, overflow: "auto", marginTop: 8 }}>
-        <div className="turn-history">
-          {rounds.map((round, ri) => (
-            <div key={ri} className="round-group">
-              <div className="round-label">第 {round.ro} 轮</div>
-              {round.turns.map((t) => {
-                const p = t.playerId === me?.id ? me : opponent;
-                return (
-                  <div key={t.turnNumber} className="turn-row">
-                    <span className="player-name">{p?.name || "?"}</span>
-                    <span className="guess-num">{t.guess}</span>
-                    <span className={`hits hits-${t.hits}`}>
-                      {hitsText(t.hits)}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          ))}
         </div>
-      </div>
+      )}
+
+      {myTurns.length > 0 && (
+        <div style={{ maxHeight: 180, overflow: "auto", marginTop: 4 }}>
+          <div className="turn-history">
+            {myTurns.slice().reverse().map((t, i) => (
+              <div key={t.turnNumber} className="turn-row">
+                <span className="guess-num" style={{ fontSize: 13 }}>第 {myTurns.length - i} 次：猜 {t.guess}</span>
+                <span className={`hits hits-${t.hits}`} style={{ fontSize: 13 }}>{hitsText(t.hits)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
