@@ -75,7 +75,7 @@ export class Room extends DurableObject<RoomEnv> {
     const player = createPlayer(crypto.randomUUID(), name, tokenHash, 1);
     this.state = initializeRoomState(roomCode, player, Date.now());
     await this.persist();
-    return this.jsonRes({ playerId: player.id });
+    return this.jsonRes({ playerId: player.id, roomState: this.publicView(player.id) });
   }
 
   private async handleJoin(request: Request): Promise<Response> {

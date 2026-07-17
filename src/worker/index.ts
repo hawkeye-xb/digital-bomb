@@ -81,9 +81,15 @@ async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
         })
       );
       if (r.ok) {
-        const d = await r.json() as { playerId: string };
+        const d = await r.json() as { playerId: string; roomState: unknown };
         return jsonResponse(
-          { roomCode: code, playerToken: t, playerId: d.playerId, roomUrl: `${url.protocol}//${url.host}/r/${code}` },
+          {
+            roomCode: code,
+            playerToken: t,
+            playerId: d.playerId,
+            roomState: d.roomState,
+            roomUrl: `${url.protocol}//${url.host}/r/${code}`,
+          },
           201
         );
       }

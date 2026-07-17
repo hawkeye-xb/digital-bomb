@@ -82,6 +82,11 @@ function sendCommand(client, type, payload, version) {
   }));
 }
 
+async function hashToken(token) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function nextState(client, causeType) {
   const update = await client.inbox.next(
     (message) => message.type === "room.updated" && message.cause.type === causeType,
@@ -97,11 +102,20 @@ try {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "Alice" }),
   });
+  assert.equal(created.roomState.players.length, 1);
+  assert.equal(created.roomState.viewerPlayerId, created.playerId);
   const joined = await json(`/api/rooms/${created.roomCode}/join`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "Bob", tokenHash: "" }),
   });
+  const restored = await json(`/api/rooms/${created.roomCode}/join`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "Bob", tokenHash: await hashToken(joined.playerToken) }),
+  });
+  assert.equal(restored.playerId, joined.playerId);
+  assert.equal(restored.roomState.players.length, 2);
 
   const alice = await connect(created.roomCode, created.playerToken);
   const bob = await connect(created.roomCode, joined.playerToken);

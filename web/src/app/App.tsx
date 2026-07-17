@@ -13,7 +13,7 @@ import { GameTransport, type ConnectionState } from "../transport/websocket.js";
 
 const API = "/api";
 
-type AppPhase = "home" | "creating" | "joining" | "in-room";
+type AppPhase = "home" | "invite" | "creating" | "joining" | "in-room";
 
 type AppState = {
   phase: AppPhase;
@@ -44,20 +44,34 @@ function saveStorage(roomCode: string, token: string, name: string) {
   localStorage.setItem("digital-bomb-players", JSON.stringify(data));
 }
 
+function inviteCodeFromPath(): string {
+  return location.pathname.match(/^\/r\/([A-HJ-NP-Z2-9]{6})$/i)?.[1]?.toUpperCase() || "";
+}
+
+function isValidClientName(name: string): boolean {
+  return /^\S{1,16}$/.test(name);
+}
+
 export default function App() {
-  const [state, setState] = useState<AppState>({
-    phase: "home",
-    roomCode: "",
-    playerToken: "",
-    playerId: "",
-    name: loadStorage()["_lastName"]?.name || "",
-    roomState: null,
-    error: null,
-    connection: "connecting",
-    notice: null,
+  const [state, setState] = useState<AppState>(() => {
+    const inviteCode = inviteCodeFromPath();
+    const storage = loadStorage();
+    return {
+      phase: inviteCode ? "invite" : "home",
+      roomCode: inviteCode,
+      playerToken: "",
+      playerId: "",
+      name: storage[inviteCode]?.name || storage["_lastName"]?.name || "",
+      roomState: null,
+      error: null,
+      connection: "connecting",
+      notice: null,
+    };
   });
 
   const transportRef = useRef<GameTransport | null>(null);
+  const createInFlightRef = useRef(false);
+  const joinInFlightRef = useRef(false);
 
   // ─── 处理服务端消息 ───
 
@@ -66,9 +80,14 @@ export default function App() {
   // ─── 创建房间 ───
 
   const createRoom = useCallback(async () => {
+    const name = state.name.trim();
+    if (!isValidClientName(name)) {
+      setState((s) => ({ ...s, error: "请先输入 1～16 个字符的昵称" }));
+      return;
+    }
+    if (createInFlightRef.current) return;
+    createInFlightRef.current = true;
     setState((s) => ({ ...s, phase: "creating", error: null }));
-
-    const name = state.name || "玩家";
     try {
       const resp = await fetch(`${API}/rooms`, {
         method: "POST",
@@ -79,6 +98,7 @@ export default function App() {
         roomCode: string;
         playerToken: string;
         playerId: string;
+        roomState: PublicRoomView;
         roomUrl?: string;
         error?: { code: string; message: string };
       };
@@ -90,6 +110,7 @@ export default function App() {
 
       saveStorage(data.roomCode, data.playerToken, name);
       saveStorage("_lastName", "", name);
+      history.replaceState(null, "", `/r/${data.roomCode}`);
 
       const t = new GameTransport(location.origin, data.roomCode, data.playerToken, {
         onState: (s, cause) => setState((prev) => ({
@@ -124,6 +145,9 @@ export default function App() {
         roomCode: data.roomCode,
         playerToken: data.playerToken,
         playerId: data.playerId,
+        name,
+        roomState: data.roomState,
+        connection: "connecting",
       }));
 
       await t.connect();
@@ -133,12 +157,21 @@ export default function App() {
         error: "创建房间失败，请重试",
         phase: "home",
       }));
+    } finally {
+      createInFlightRef.current = false;
     }
   }, [state.name]);
 
   // ─── 加入房间 ───
 
   const joinRoom = useCallback(async (code: string, name: string) => {
+    const normalizedName = name.trim();
+    if (!isValidClientName(normalizedName)) {
+      setState((s) => ({ ...s, error: "请先输入 1～16 个字符的昵称" }));
+      return;
+    }
+    if (joinInFlightRef.current) return;
+    joinInFlightRef.current = true;
     setState((s) => ({ ...s, phase: "joining", error: null }));
 
     const storage = loadStorage();
@@ -149,7 +182,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name,
+          name: normalizedName,
           tokenHash: saved ? await hashToken(saved.token) : "",
         }),
       });
@@ -161,13 +194,18 @@ export default function App() {
       };
 
       if (data.error) {
-        setState((s) => ({ ...s, error: data.error!.message, phase: "home" }));
+        setState((s) => ({
+          ...s,
+          error: data.error!.message,
+          phase: inviteCodeFromPath() === code ? "invite" : "home",
+        }));
         return;
       }
 
       const finalToken = saved?.token || data.playerToken;
-      saveStorage(code, finalToken, name);
-      saveStorage("_lastName", "", name);
+      saveStorage(code, finalToken, normalizedName);
+      saveStorage("_lastName", "", normalizedName);
+      history.replaceState(null, "", `/r/${code}`);
 
       const t = new GameTransport(location.origin, code, finalToken, {
         onState: (s, cause) => setState((prev) => ({
@@ -201,14 +239,21 @@ export default function App() {
         phase: "in-room",
         roomCode: code,
         playerToken: finalToken,
-        playerId: data.playerId || data.roomState.players.find(
-          (p) => p.name === name,
-        )?.id || "",
+        playerId: data.playerId,
+        name: normalizedName,
+        roomState: data.roomState,
+        connection: "connecting",
       }));
 
       await t.connect();
     } catch {
-      setState((s) => ({ ...s, error: "加入失败，检查房间码", phase: "home" }));
+      setState((s) => ({
+        ...s,
+        error: "加入失败，请检查房间码或网络",
+        phase: inviteCodeFromPath() === code ? "invite" : "home",
+      }));
+    } finally {
+      joinInFlightRef.current = false;
     }
   }, []);
 
@@ -235,6 +280,7 @@ export default function App() {
   const goHome = useCallback(() => {
     transportRef.current?.disconnect();
     transportRef.current = null;
+    history.replaceState(null, "", "/");
     setState((s) => ({
       ...s,
       phase: "home",
@@ -244,15 +290,20 @@ export default function App() {
     }));
   }, []);
 
+  const cancelInvite = useCallback(() => {
+    history.replaceState(null, "", "/");
+    setState((s) => ({ ...s, phase: "home", roomCode: "", error: null }));
+  }, []);
+
   // ─── 从 URL 检测房间码 ───
 
   useEffect(() => {
-    const match = location.pathname.match(/^\/r\/([A-HJ-NP-Z2-9]{6})$/i);
-    if (match && state.phase === "home") {
-      const code = match[1]!.toUpperCase();
-      joinRoom(code, state.name || "玩家");
+    if (state.phase !== "invite" || !state.roomCode) return;
+    const saved = loadStorage()[state.roomCode];
+    if (saved?.token && isValidClientName(saved.name)) {
+      void joinRoom(state.roomCode, saved.name);
     }
-  }, [state.phase, state.name, joinRoom]);
+  }, [state.phase, state.roomCode, joinRoom]);
 
   // ─── 前台恢复 ───
 
@@ -282,8 +333,10 @@ export default function App() {
       name={state.name}
       setName={(n) => setState((s) => ({ ...s, name: n }))}
       onCreate={createRoom}
-      onJoin={(code) => joinRoom(code, state.name || "玩家")}
-      loading={state.phase !== "home"}
+      onJoin={(code) => joinRoom(code, state.name)}
+      inviteCode={inviteCodeFromPath()}
+      onCancelInvite={cancelInvite}
+      loadingPhase={state.phase === "creating" || state.phase === "joining" ? state.phase : null}
       error={state.error}
       onClearError={() => setState((s) => ({ ...s, error: null }))}
     />
@@ -328,7 +381,9 @@ function HomeScreen({
   setName,
   onCreate,
   onJoin,
-  loading,
+  inviteCode,
+  onCancelInvite,
+  loadingPhase,
   error,
   onClearError,
 }: {
@@ -336,23 +391,30 @@ function HomeScreen({
   setName: (n: string) => void;
   onCreate: () => void;
   onJoin: (code: string) => void;
-  loading: boolean;
+  inviteCode: string;
+  onCancelInvite: () => void;
+  loadingPhase: "creating" | "joining" | null;
   error: string | null;
   onClearError: () => void;
 }) {
   const [codeInput, setCodeInput] = useState("");
   const [showJoin, setShowJoin] = useState(false);
+  const validName = isValidClientName(name.trim());
+  const loading = loadingPhase !== null;
 
   return (
     <div className="container" style={{ justifyContent: "center" }}>
       <div className="header">
         <h1>💣 数字炸弹</h1>
-        <p className="subtitle">猜中数字和位置，先找出对方的四位密码</p>
+        <p className="subtitle">
+          {inviteCode ? `邀请你加入房间 ${inviteCode}` : "猜中数字和位置，先找出对方的四位密码"}
+        </p>
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <div>
           <label
+            htmlFor="player-name"
             style={{
               display: "block",
               fontSize: 13,
@@ -363,6 +425,7 @@ function HomeScreen({
             你的昵称
           </label>
           <input
+            id="player-name"
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value.slice(0, 16))}
@@ -380,18 +443,40 @@ function HomeScreen({
           />
         </div>
 
-        <button
-          className="btn btn-primary"
-          onClick={onCreate}
-          disabled={loading}
-        >
-          {loading ? "创建中…" : "创建房间"}
-        </button>
+        {!validName && (
+          <p style={{ fontSize: 12, color: "var(--text-dim)", margin: 0 }}>
+            先填写昵称，再{inviteCode ? "加入房间" : "创建或加入房间"}
+          </p>
+        )}
 
-        {!showJoin ? (
+        {inviteCode ? (
+          <>
+            <button
+              className="btn btn-primary"
+              onClick={() => onJoin(inviteCode)}
+              disabled={loading || !validName}
+            >
+              {loadingPhase === "joining" ? "加入中…" : `加入房间 ${inviteCode}`}
+            </button>
+            <button className="btn btn-secondary" onClick={onCancelInvite} disabled={loading}>
+              返回首页
+            </button>
+          </>
+        ) : (
+          <button
+            className="btn btn-primary"
+            onClick={onCreate}
+            disabled={loading || !validName}
+          >
+            {loadingPhase === "creating" ? "创建中…" : "创建房间"}
+          </button>
+        )}
+
+        {!inviteCode && (!showJoin ? (
           <button
             className="btn btn-secondary"
             onClick={() => setShowJoin(true)}
+            disabled={!validName}
           >
             输入房间码加入
           </button>
@@ -423,7 +508,7 @@ function HomeScreen({
                 className="btn btn-primary"
                 style={{ width: "auto", padding: "12px 20px" }}
                 onClick={() => codeInput.length === 6 && onJoin(codeInput)}
-                disabled={loading || codeInput.length !== 6}
+                disabled={loading || !validName || codeInput.length !== 6}
               >
                 加入
               </button>
@@ -435,7 +520,7 @@ function HomeScreen({
               取消
             </button>
           </div>
-        )}
+        ))}
       </div>
 
       {error && <Toast message={error} onDismiss={onClearError} />}
@@ -609,7 +694,7 @@ function WaitingPhase({ roomCode, onShare, onCopy }: { roomCode: string; onShare
       </div>
       <p style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 10 }}>把这串码发给朋友</p>
       <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={onShare}>
-        复制邀请链接
+        分享邀请链接
       </button>
     </div>
   );
