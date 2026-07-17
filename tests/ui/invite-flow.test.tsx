@@ -92,6 +92,16 @@ describe("invite flow", () => {
     expect(connect).toHaveBeenCalledTimes(1);
   });
 
+  it("recovers a room code when legacy share text is pasted after the URL", () => {
+    history.replaceState(null, "", "/r/ABC234%20%E6%9D%A5%E7%8E%A9%E6%95%B0%E5%AD%97%E7%82%B8%E5%BC%B9");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    render(<App />);
+
+    expect(screen.getByRole("button", { name: "加入房间 ABC234" })).toBeTruthy();
+    expect(location.pathname).toBe("/r/ABC234");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("requires a name before creating a room", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
     render(<App />);
@@ -118,6 +128,30 @@ describe("invite flow", () => {
     expect(await screen.findByRole("button", { name: "离开" })).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares only the canonical invite URL", async () => {
+    const share = vi.fn(async () => {});
+    Object.defineProperty(navigator, "share", { configurable: true, value: share });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        roomCode: "ABC234",
+        playerId: "p1",
+        playerToken: "creator-token",
+        roomState: createdRoom(),
+      }),
+    } as Response);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(screen.getByLabelText("你的昵称"), "Alice");
+    await user.click(screen.getByRole("button", { name: "创建房间" }));
+    await user.click(await screen.findByRole("button", { name: "分享" }));
+
+    expect(share).toHaveBeenCalledWith({
+      title: "数字炸弹",
+      url: `${location.origin}/r/ABC234`,
+    });
   });
 
   it("reuses a saved seat from an invite link instead of joining again", async () => {
