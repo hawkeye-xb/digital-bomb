@@ -74,16 +74,14 @@ export default {
 // ─── WebSocket 处理 ───
 
 async function handleWebSocket(request: Request, env: Env, roomCode: string): Promise<Response> {
-const url = new URL(request.url);
-const ticket = url.searchParams.get("ticket") || "";
+  const url = new URL(request.url);
+  const ticket = url.searchParams.get("ticket") || "";
 
-// 调试：验证 ticket
-try {
+  // 验证 ticket
   const secret = env.WS_TICKET_SECRET;
   if (!secret) return new Response("missing WS_TICKET_SECRET", { status: 500 });
   const claims = await verifyTicket(secret, ticket);
   if (!claims || claims.roomCode !== roomCode) {
-    // 调试：返回为什么失败
     let debug = `ticket invalid. secret_len=${secret.length}`;
     if (claims) debug += ` claims_room=${claims.roomCode} vs ${roomCode} expires=${claims.expiresAt} now=${Date.now()}`;
     return new Response(debug, { status: 401 });
@@ -145,7 +143,7 @@ try {
 
   return new Response(null, {
     status: 101,
-    webSocket: server,
+    webSocket: client,
   });
 }
 
