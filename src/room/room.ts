@@ -1,35 +1,21 @@
-// ─── Room Durable Object ───
+// ─── Room Durable Object（纯 HTTP 状态存储） ───
+// WebSocket 由 Worker 直接处理，DO 只负责状态读写
 
 import { DurableObject } from "cloudflare:workers";
-import type {
-  RoomState,
-  PublicCause,
-} from "../shared/domain.js";
-import type {
-  ServerMessage,
-  RoomSnapshot,
-  RoomUpdated,
-  RoomExpired,
-  CommandError,
-} from "../shared/protocol.js";
+import type { RoomState } from "../shared/domain.js";
 import type { DomainErrorCode } from "../shared/protocol.js";
-import { DomainError } from "../shared/validation.js";
+import { DomainError, isValidName, isValidGuess } from "../shared/validation.js";
 import {
+  initializeRoomState,
+  createPlayer,
+  addPlayer,
   readySet,
   readyUnset,
   submitGuess,
   rematchSet,
   isExpired,
 } from "./engine.js";
-import { toPublicRoomView } from "./public-view.js";
 import { loadState, saveState, deleteAllState } from "./storage.js";
-
-// ─── WebSocket attachment ───
-
-type SocketAttachment = {
-  playerId: string;
-  connectedAt: number;
-};
 
 // ─── Env ───
 
@@ -38,440 +24,251 @@ export interface RoomEnv {
 }
 
 export class Room extends DurableObject<RoomEnv> {
-  private state: RoomState | null = null;
-  private loaded = false;
-
-  // ─── HTTP 处理 ───
+  // ─── HTTP 路由 ───
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+    await this.load();
 
-    await this.ensureLoaded();
-
-    // 处理 WebSocket 升级（自定义 header，因为 Upgrade 在 DO 间通信中被剥离）
-    if (request.headers.get("X-DO-WS-Upgrade") === "1") {
-      return this.handleWebSocketUpgrade(request);
-    }
-
-    // 路由
+    // 初始化
     if (path.endsWith("/init") && request.method === "POST") {
       return this.handleInit(request);
     }
 
+    // 加入
     if (path.endsWith("/join") && request.method === "POST") {
       return this.handleJoin(request);
     }
 
+    // WebSocket ticket
     if (path.endsWith("/socket-ticket") && request.method === "POST") {
       return this.handleSocketTicket(request);
+    }
+
+    // 读取状态（Worker 用的）
+    if (path.endsWith("/state") && request.method === "GET") {
+      return this.jsonRes({ state: this.state });
+    }
+
+    // 执行命令（Worker 发的）
+    if (path.endsWith("/command") && request.method === "POST") {
+      return this.handleCommand(request);
     }
 
     return this.errorRes("ROOM_NOT_FOUND", "未知操作", 404);
   }
 
-  // ─── 初始化房间 ───
+  // ─── 初始化 ───
 
-  private async handleInit(request: Request): Promise<Response> {
-    // 已初始化则返回冲突
+  private handleInit(request: Request): Response | Promise<Response> {
     if (this.state) {
       return this.errorRes("COMMAND_REJECTED", "房间已存在", 409, "ALREADY_EXISTS");
     }
+    return this._init(request);
+  }
 
-    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
-    const name = typeof body?.name === "string" ? body.name : "";
+  private async _init(request: Request): Promise<Response> {
+    const body = await reqJson(request);
+    const name = String(body?.name || "").slice(0, 16);
+    const tokenHash = String(body?.tokenHash || "");
 
-    const { generatePlayerToken, hashToken } = await import("../worker/auth.js");
-    const { createPlayer, initializeRoomState } = await import("./engine.js");
+    if (!isValidName(name)) {
+      return this.errorRes("INVALID_NAME", "昵称 1~16 个可见字符", 400);
+    }
 
     const playerId = crypto.randomUUID();
-    const token = generatePlayerToken();
-    const tokenHash = await hashToken(token);
     const player = createPlayer(playerId, name, tokenHash, 1);
-    this.state = initializeRoomState(this.getRoomCode(), player, Date.now());
+    // DO name == room code (created via idFromName)
+    const roomCode = this.getRoomCode();
+    this.state = initializeRoomState(roomCode, player, Date.now());
     await this.persist();
 
-    return this.jsonRes({ playerToken: token, playerId });
+    return this.jsonRes({ playerId });
   }
 
-  // ─── 加入房间 ───
+  // ─── 加入 ───
 
   private async handleJoin(request: Request): Promise<Response> {
-    if (!this.state) {
-      return this.errorRes("ROOM_NOT_FOUND", "房间不存在", 404);
+    if (!this.state) return this.roomNotFound();
+
+    const body = await reqJson(request);
+    const name = String(body?.name || "").slice(0, 16);
+    const tokenHash = String(body?.tokenHash || "");
+    let playerToken = "";
+
+    if (!isValidName(name)) {
+      return this.errorRes("INVALID_NAME", "昵称 1~16 个可见字符", 400);
     }
 
-    const maxPlayers = 2;
-    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
-    const name = typeof body?.name === "string" ? body.name : "";
-    const tokenHash = typeof body?.tokenHash === "string" ? body.tokenHash : "";
+    // 已加入过
+    const existing = this.state.players.find((p) => p.tokenHash === tokenHash);
+    if (existing) {
+      return this.jsonRes({
+        playerId: existing.id,
+        playerToken: "",
+        roomState: this.publicView(existing.id),
+      });
+    }
+
+    if (this.state.players.length >= 2) {
+      return this.errorRes("ROOM_FULL", "房间已满", 409);
+    }
+
+    const { generatePlayerToken, hashToken } = await import(
+      "../worker/auth.js"
+    );
+    const playerId = crypto.randomUUID();
+    playerToken = generatePlayerToken();
+    const hash = await hashToken(playerToken);
+    const seat = 2 as const;
+    const player = createPlayer(playerId, name, hash, seat);
 
     try {
-      const { generatePlayerToken, hashToken } = await import("../worker/auth.js");
-      const { addPlayer, createPlayer } = await import("./engine.js");
-      const playerId = crypto.randomUUID();
-
-      // 检查是否满员
-      if (this.state.players.length >= maxPlayers) {
-        return this.errorRes("ROOM_FULL", "房间已满", 409);
-      }
-
-      // 检查是否已加入（通过 tokenHash）
-      const existing = this.state.players.find((p) => p.tokenHash === tokenHash);
-      if (existing) {
-        return this.jsonRes({
-          playerId: existing.id,
-          playerToken: "", // 不发新 token，客户端用 localStorage 的
-          roomState: this.publicView(existing.id),
-        });
-      }
-
-      const token = generatePlayerToken();
-      const hash = await hashToken(token);
-      const seat = (this.state.players.length + 1) as 1 | 2;
-      const player = createPlayer(playerId, name, hash, seat);
-
       this.state = addPlayer(this.state, player, Date.now());
-      await this.persist();
-
-      // 广播
-      this.broadcast("player.joined", { type: "player.joined", playerId });
-
-      return this.jsonRes({
-        playerId,
-        playerToken: token,
-        roomState: this.publicView(playerId),
-      });
-    } catch (err) {
-      return this.domainError(err);
+    } catch (e) {
+      return this.domainError(e);
     }
+
+    await this.persist();
+    return this.jsonRes({
+      playerId,
+      playerToken,
+      roomState: this.publicView(playerId),
+    });
   }
 
-  // ─── WebSocket ticket ───
+  // ─── WebSocket Ticket ───
 
-  private async handleSocketTicket(request: Request): Promise<Response> {
-    if (!this.state) {
-      return this.errorRes("ROOM_NOT_FOUND", "房间不存在", 404);
-    }
+  private async handleSocketTicket(
+    request: Request,
+  ): Promise<Response> {
+    if (!this.state) return this.roomNotFound();
 
-    const authHeader = request.headers.get("Authorization") || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-
-    if (!token) {
-      return this.errorRes("UNAUTHORIZED", "缺少凭证", 401);
-    }
+    const auth = request.headers.get("Authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (!token) return this.errorRes("UNAUTHORIZED", "缺少凭证", 401);
 
     const { hashToken } = await import("../worker/auth.js");
     const tokenHash = await hashToken(token);
     const player = this.state.players.find((p) => p.tokenHash === tokenHash);
-
-    if (!player) {
-      return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
-    }
+    if (!player) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
 
     const { signTicket } = await import("../worker/auth.js");
     const secret = this.env.WS_TICKET_SECRET || "dev-secret";
-    const nonce = crypto.randomUUID();
     const claims = {
       roomCode: this.state.roomCode,
       playerId: player.id,
-      expiresAt: Date.now() + 60_000, // 60 秒
-      nonce,
+      expiresAt: Date.now() + 60_000,
+      nonce: crypto.randomUUID(),
     };
 
-    const ticket = await signTicket(secret, claims);
-    return this.jsonRes({ ticket, expiresAt: claims.expiresAt });
+    const ticketStr = await signTicket(secret, claims);
+    return this.jsonRes({ ticket: ticketStr, expiresAt: claims.expiresAt });
   }
 
-  // ─── WebSocket 处理 ───
+  // ─── 执行命令 ───
 
-  private async handleWebSocketUpgrade(request: Request): Promise<Response> {
-    if (!this.state) {
-      return new Response("房间不存在", { status: 404 });
-    }
+  private async handleCommand(request: Request): Promise<Response> {
+    if (!this.state) return this.roomNotFound();
 
-    // ticket 从 body 读取（Worker 已从 query 提取）
-    let ticket = "";
-    try {
-      const body = await request.json() as { ticket?: string };
-      ticket = body.ticket || "";
-    } catch {
-      // fallback: try query
-      const url = new URL(request.url);
-      ticket = url.searchParams.get("ticket") || "";
-    }
-
-    // 验证 ticket
-    const { verifyTicket } = await import("../worker/auth.js");
-    const secret = this.env.WS_TICKET_SECRET || "dev-secret";
-    const claims = await verifyTicket(secret, ticket);
-
-    if (!claims || claims.roomCode !== this.state.roomCode) {
-      return new Response("ticket 无效或已过期", { status: 401 });
-    }
-
-    const player = this.state.players.find((p) => p.id === claims.playerId);
-    if (!player) {
-      return new Response("玩家不在房间中", { status: 401 });
-    }
-
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-
-    // 关闭该玩家的旧连接
-    const existingSockets = this.ctx.getWebSockets();
-    for (const ws of existingSockets) {
-      const att = ws.deserializeAttachment() as SocketAttachment | null;
-      if (att?.playerId === player.id) {
-        try { ws.close(4001, "replaced by new connection"); } catch { /* noop */ }
-      }
-    }
-
-    this.ctx.acceptWebSocket(server as never);
-    (server as WebSocket).serializeAttachment({
-      playerId: player.id,
-      connectedAt: Date.now(),
-    } satisfies SocketAttachment);
-
-    // 立即发送当前 snapshot
-    const snapshot: ServerMessage = {
-      type: "room.snapshot",
-      version: this.state.version,
-      state: this.publicView(player.id),
-    };
-    (server as WebSocket).send(JSON.stringify(snapshot));
-
-    // 广播更新（通知对方新连接）
-    const cause: PublicCause = { type: "player.joined", playerId: player.id };
-    this.broadcast("player.joined", cause, player.id);
-
-    return new Response(null, { status: 101, webSocket: client as never });
-  }
-
-  // ─── WebSocket 消息处理 ───
-
-  async webSocketMessage(ws: WebSocket, raw: string) {
-    const att = ws.deserializeAttachment() as SocketAttachment | null;
-    if (!att || !this.state) return;
-
-    try {
-      const msg = JSON.parse(raw);
-      const { type, commandId, expectedVersion, payload } = msg;
-
-      switch (type) {
-        case "ready.set":
-          await this.handleReadySet(att.playerId, payload.secret, commandId, expectedVersion);
-          break;
-        case "ready.unset":
-          await this.handleReadyUnset(att.playerId, commandId, expectedVersion);
-          break;
-        case "guess.submit":
-          await this.handleGuessSubmit(att.playerId, payload.guess, commandId, expectedVersion);
-          break;
-        case "rematch.set":
-          await this.handleRematchSet(att.playerId, payload.ready, commandId, expectedVersion);
-          break;
-        case "state.request":
-          await this.sendSnapshot(ws, att.playerId);
-          break;
-        default:
-          this.sendError(ws, commandId || "", "COMMAND_REJECTED", "未知命令", this.state.version);
-      }
-    } catch {
-      this.sendError(ws, "", "INVALID_INPUT", "无效的 JSON 消息", this.state?.version ?? 0);
-    }
-  }
-
-  webSocketClose(ws: WebSocket) {
-    // 连接关闭；广播在线状态变化
-    const att = ws.deserializeAttachment() as SocketAttachment | null;
-    if (att && this.state) {
-      this.broadcastToAll(this.state.version, undefined);
-    }
-  }
-
-  webSocketError(_ws: WebSocket, _err: unknown) {
-    // 静默处理
-  }
-
-  // ─── 命令处理 ───
-
-  private async handleReadySet(playerId: string, secret: string, commandId: string, expectedVersion: number) {
-    try {
-      const { state } = readySet(this.state!, playerId, secret, commandId, Date.now());
-      this.state = state;
-      await this.persist();
-
-      const cause: PublicCause = { type: "ready.changed", playerId, ready: true };
-      this.broadcastToAll(this.state.version, cause);
-
-      // 如果游戏开始了
-      if (state.phase === "playing" && state.currentGame) {
-        const gameCause: PublicCause = {
-          type: "game.started",
-          firstPlayerId: state.currentGame.firstPlayerId,
-        };
-        this.broadcastToAll(this.state.version, gameCause);
-      }
-    } catch (err) {
-      this.domainErrorToWS(playerId, commandId, err);
-    }
-  }
-
-  private async handleReadyUnset(playerId: string, commandId: string, expectedVersion: number) {
-    try {
-      const { state } = readyUnset(this.state!, playerId, commandId, Date.now());
-      this.state = state;
-      await this.persist();
-
-      const cause: PublicCause = { type: "ready.changed", playerId, ready: false };
-      this.broadcastToAll(this.state.version, cause);
-    } catch (err) {
-      this.domainErrorToWS(playerId, commandId, err);
-    }
-  }
-
-  private async handleGuessSubmit(playerId: string, guess: string, commandId: string, expectedVersion: number) {
-    try {
-      const { state, hitResult } = submitGuess(
-        this.state!, playerId, guess, commandId, expectedVersion, Date.now(),
-      );
-      this.state = state;
-      await this.persist();
-
-      const cause: PublicCause = {
-        type: "guess.resolved",
-        playerId,
-        guess,
-        hits: hitResult.hits,
-        won: hitResult.won,
-      };
-      this.broadcastToAll(this.state.version, cause);
-    } catch (err) {
-      this.domainErrorToWS(playerId, commandId, err);
-    }
-  }
-
-  private async handleRematchSet(playerId: string, ready: boolean, commandId: string, expectedVersion: number) {
-    try {
-      const { state } = rematchSet(this.state!, playerId, ready, commandId, Date.now());
-      this.state = state;
-      await this.persist();
-
-      const cause: PublicCause = { type: "rematch.changed", playerId, ready };
-      this.broadcastToAll(this.state.version, cause);
-
-      // 如果重置了
-      if (state.phase === "preparing" && state.completedGames.length > 0) {
-        const prevLoser = state.previousLoserId;
-        if (prevLoser) {
-          const gameCause: PublicCause = { type: "game.reset", firstPlayerId: prevLoser };
-          this.broadcastToAll(this.state.version, gameCause);
-        }
-      }
-    } catch (err) {
-      this.domainErrorToWS(playerId, commandId, err);
-    }
-  }
-
-  // ─── 广播 ───
-
-  private broadcastToAll(version: number, cause: PublicCause | undefined) {
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      const att = ws.deserializeAttachment() as SocketAttachment | null;
-      if (!att) continue;
-
-      if (cause) {
-        const msg: RoomUpdated = {
-          type: "room.updated",
-          version,
-          cause,
-          state: this.publicView(att.playerId),
-        };
-        try { ws.send(JSON.stringify(msg)); } catch { /* noop */ }
-      } else {
-        // 无 cause，只发 snapshot
-        const msg: RoomSnapshot = {
-          type: "room.snapshot",
-          version,
-          state: this.publicView(att.playerId),
-        };
-        try { ws.send(JSON.stringify(msg)); } catch { /* noop */ }
-      }
-    }
-  }
-
-  private broadcast(_event: string, cause: PublicCause, excludePlayerId?: string) {
-    this.broadcastToAll(this.state!.version, cause);
-  }
-
-  private sendSnapshot(ws: WebSocket, playerId: string) {
-    const msg: RoomSnapshot = {
-      type: "room.snapshot",
-      version: this.state!.version,
-      state: this.publicView(playerId),
-    };
-    try { ws.send(JSON.stringify(msg)); } catch { /* noop */ }
-  }
-
-  private sendError(ws: WebSocket, commandId: string, code: DomainErrorCode, message: string, currentVersion: number) {
-    const msg: CommandError = {
-      type: "command.error",
+    const body = await reqJson(request);
+    const {
+      action,
       commandId,
-      code,
-      message,
-      currentVersion,
+      expectedVersion,
+      payload,
+      playerId,
+    } = body as {
+      action: string;
+      commandId: string;
+      expectedVersion: number;
+      payload: Record<string, unknown>;
+      playerId: string;
     };
-    try { ws.send(JSON.stringify(msg)); } catch { /* noop */ }
-  }
 
-  private domainErrorToWS(playerId: string, commandId: string, err: unknown) {
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      const att = ws.deserializeAttachment() as SocketAttachment | null;
-      if (att?.playerId === playerId) {
-        if (err instanceof DomainError) {
-          this.sendError(ws, commandId, err.code, err.message, this.state?.version ?? 0);
-        } else {
-          this.sendError(ws, commandId, "INTERNAL_ERROR", "服务端错误", this.state?.version ?? 0);
+    try {
+      switch (action) {
+        case "ready.set": {
+          const secret = String(payload?.secret || "");
+          if (!isValidGuess(secret)) throw new DomainError("INVALID_SECRET", "密码不是四位数字");
+          const { state } = readySet(this.state, playerId, secret, commandId, Date.now());
+          this.state = state;
+          const cause = state.phase === "playing" && state.currentGame
+            ? { type: "game.started" as const, firstPlayerId: state.currentGame.firstPlayerId }
+            : { type: "ready.changed" as const, playerId, ready: true };
+          await this.persist();
+          return this.jsonRes({ success: true, version: state.version, cause });
         }
+
+        case "ready.unset": {
+          const { state } = readyUnset(this.state, playerId, commandId, Date.now());
+          this.state = state;
+          const cause = { type: "ready.changed" as const, playerId, ready: false };
+          await this.persist();
+          return this.jsonRes({ success: true, version: state.version, cause });
+        }
+
+        case "guess.submit": {
+          const guess = String(payload?.guess || "");
+          if (!isValidGuess(guess)) throw new DomainError("INVALID_GUESS", "猜测不是四位数字");
+          const { state, hitResult } = submitGuess(
+            this.state, playerId, guess, commandId, expectedVersion, Date.now(),
+          );
+          this.state = state;
+          const cause = {
+            type: "guess.resolved" as const,
+            playerId, guess,
+            hits: hitResult.hits,
+            won: hitResult.won,
+          };
+          await this.persist();
+          return this.jsonRes({ success: true, version: state.version, cause });
+        }
+
+        case "rematch.set": {
+          const ready = Boolean(payload?.ready);
+          const { state } = rematchSet(this.state, playerId, ready, commandId, Date.now());
+          this.state = state;
+
+          let cause: { type: string; playerId: string; ready: boolean } | { type: string; firstPlayerId: string };
+          if (state.phase === "preparing" && state.completedGames.length > 0 && state.previousLoserId) {
+            cause = { type: "game.reset" as const, firstPlayerId: state.previousLoserId };
+          } else {
+            cause = { type: "rematch.changed" as const, playerId, ready };
+          }
+          await this.persist();
+          return this.jsonRes({ success: true, version: state.version, cause });
+        }
+
+        default:
+          return this.errorRes("COMMAND_REJECTED", `未知命令: ${action}`, 400);
       }
+    } catch (e) {
+      return this.domainErrorToJson(e, commandId, this.state?.version || 0);
     }
   }
 
   // ─── Alarm ───
 
   async alarm(): Promise<void> {
-    await this.ensureLoaded();
+    await this.load();
     if (!this.state) return;
 
     if (!isExpired(this.state, Date.now())) {
-      // 还没到 expiresAt，重设 alarm
       await this.ctx.storage.setAlarm(this.state.expiresAt);
       return;
-    }
-
-    // 通知客户端
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      try {
-        ws.send(JSON.stringify({ type: "room.expired" } satisfies RoomExpired));
-        ws.close(4002, "room expired");
-      } catch { /* noop */ }
     }
 
     await deleteAllState(this.ctx.storage);
   }
 
-  // ─── 辅助 ───
+  // ─── 辅助方法 ───
 
-  private getRoomCode(): string {
-    // Durable Object created with idFromName(roomCode)
-    return String(this.ctx.id);
-  }
+  private state: RoomState | null = null;
+  private loaded = false;
 
-  private async ensureLoaded() {
+  private async load() {
     if (this.loaded) return;
     this.state = await loadState(this.ctx.storage);
     this.loaded = true;
@@ -483,15 +280,49 @@ export class Room extends DurableObject<RoomEnv> {
     await this.ctx.storage.setAlarm(this.state.expiresAt);
   }
 
-  private publicView(viewerPlayerId: string | null) {
-    if (!this.state) throw new DomainError("INTERNAL_ERROR", "无房间状态");
-    const presence = new Map<string, boolean>();
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
-      const att = ws.deserializeAttachment() as SocketAttachment | null;
-      if (att) presence.set(att.playerId, true);
-    }
-    return toPublicRoomView(this.state, viewerPlayerId, presence);
+  private getRoomCode(): string {
+    // DO name is the room code (created via idFromName)
+    return String((this.ctx as unknown as { id: { toString: () => string } }).id);
+  }
+
+  private roomNotFound() {
+    return this.errorRes("ROOM_NOT_FOUND", "房间不存在", 404);
+  }
+
+  private publicView(playerId: string | null) {
+    if (!this.state) return null;
+    // 简单脱敏
+    const gameEnded = this.state.phase === "finished";
+    return {
+      roomCode: this.state.roomCode,
+      phase: this.state.phase,
+      version: this.state.version,
+      players: this.state.players.map((p) => ({
+        id: p.id,
+        seat: p.seat,
+        name: p.name,
+        ready: p.ready,
+        connected: false,
+        secret: gameEnded || p.id === playerId ? p.secret : null,
+      })),
+      currentGame: this.state.currentGame,
+      completedGames: this.state.completedGames.map((g) => ({
+        gameNumber: g.gameNumber,
+        firstPlayerId: g.firstPlayerId,
+        currentPlayerId: g.currentPlayerId,
+        winnerPlayerId: g.winnerPlayerId,
+        loserPlayerId: g.loserPlayerId,
+        startedAt: g.startedAt,
+        finishedAt: g.finishedAt,
+        turns: g.turns,
+      })),
+      previousLoserId: this.state.previousLoserId,
+      rematchReadyPlayerIds: this.state.rematchReadyPlayerIds,
+      createdAt: this.state.createdAt,
+      lastActivityAt: this.state.lastActivityAt,
+      expiresAt: this.state.expiresAt,
+      viewerPlayerId: playerId,
+    };
   }
 
   private jsonRes(data: unknown, status = 200) {
@@ -512,16 +343,33 @@ export class Room extends DurableObject<RoomEnv> {
     );
   }
 
-  private domainError(err: unknown) {
-    if (err instanceof DomainError) {
-      return this.errorRes(err.code, err.message, domainErrorStatus(err.code));
+  private domainError(e: unknown) {
+    if (e instanceof DomainError) {
+      return this.errorRes(e.code, e.message, domainStatus(e.code));
     }
-    console.error("Unexpected error:", err);
-    return this.errorRes("INTERNAL_ERROR", "服务端内部错误", 500);
+    console.error("Unexpected:", e);
+    return this.errorRes("INTERNAL_ERROR", "内部错误", 500);
+  }
+
+  private domainErrorToJson(e: unknown, commandId: string, version: number) {
+    if (e instanceof DomainError) {
+      return this.jsonRes({
+        success: false,
+        error: { code: e.code, message: e.message },
+        commandId,
+        version,
+      }, domainStatus(e.code));
+    }
+    return this.jsonRes({
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: "内部错误" },
+      commandId,
+      version,
+    }, 500);
   }
 }
 
-function domainErrorStatus(code: DomainErrorCode): number {
+function domainStatus(code: DomainErrorCode): number {
   switch (code) {
     case "ROOM_NOT_FOUND": return 404;
     case "UNAUTHORIZED":
@@ -537,5 +385,13 @@ function domainErrorStatus(code: DomainErrorCode): number {
     case "INVALID_SECRET":
     case "INVALID_GUESS": return 400;
     case "INTERNAL_ERROR": return 500;
+  }
+}
+
+async function reqJson(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    return await request.json() as Record<string, unknown>;
+  } catch {
+    return null;
   }
 }
