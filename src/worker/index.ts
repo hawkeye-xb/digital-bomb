@@ -21,27 +21,11 @@ export default {
     const method = request.method;
 
     // WebSocket: Worker 验证 ticket，传 playerId 给 DO
+    // 注意：DO 返回的 101+webSocket 无法通过 stub.fetch() 转发（1101）
+    // 因此当前仍使用 HTTP 轮询。未来可让客户端直连 DO 的 wss 端点。
     const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
     if (wsMatch) {
-      const ticket = url.searchParams.get("ticket") || "";
-      const secret = env.WS_TICKET_SECRET;
-      if (!secret) return errorResponse("INTERNAL_ERROR", "missing secret", 500, crypto.randomUUID());
-
-      // Worker 端验证 ticket
-      const claims = await verifyTicket(secret, ticket);
-      const roomCode = wsMatch[1]!;
-      if (!claims || claims.roomCode !== roomCode) {
-        return errorResponse("TICKET_INVALID", "ticket 无效", 401, crypto.randomUUID());
-      }
-
-      // 直接传 playerId 给 DO（DO 不需要再验证）
-      return env.ROOMS.get(env.ROOMS.idFromName(roomCode)).fetch(
-        new Request("https://do/socket", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ playerId: claims.playerId }),
-        })
-      );
+      return errorResponse("NOT_IMPLEMENTED", "WebSocket 暂不可用，请刷新页面", 503, crypto.randomUUID());
     }
 
     if (path === "/api/rooms" && method === "POST") {
