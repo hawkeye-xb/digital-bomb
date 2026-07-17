@@ -262,7 +262,7 @@ export class Room extends DurableObject<RoomEnv> {
     }
   }
 
-  webSocketClose(socket: WebSocket): void {
+  async webSocketClose(socket: WebSocket): Promise<void> {
     const attachment = readAttachment(socket);
     if (!attachment) return;
     const stillConnected = this.ctx.getWebSockets().some((candidate) => {
@@ -270,6 +270,12 @@ export class Room extends DurableObject<RoomEnv> {
       return readAttachment(candidate)?.playerId === attachment.playerId;
     });
     this.broadcastPresence(attachment.playerId, stillConnected, "idle");
+
+    // 双方都断连 → 设 5 分钟清理 alarm
+    if (this.state && !this.hasAnyConnection()) {
+      const cleanupAt = Date.now() + 5 * 60 * 1000;
+      await this.ctx.storage.setAlarm(cleanupAt);
+    }
   }
 
   webSocketError(socket: WebSocket): void {
@@ -279,6 +285,18 @@ export class Room extends DurableObject<RoomEnv> {
   async alarm(): Promise<void> {
     await this.load();
     if (!this.state) return;
+
+    // 双方断连超时清理：alarm 触发时仍无连接 → 直接清房
+    if (!this.hasAnyConnection()) {
+      for (const socket of this.ctx.getWebSockets()) {
+        try { socket.close(4002, "cleanup"); } catch { /* already closed */ }
+      }
+      await deleteAllState(this.ctx.storage);
+      this.state = null;
+      return;
+    }
+
+    // 有人重连了 → 恢复正常过期
     if (!isExpired(this.state, Date.now())) {
       await this.ctx.storage.setAlarm(this.state.expiresAt);
       return;
@@ -291,6 +309,10 @@ export class Room extends DurableObject<RoomEnv> {
     }
     await deleteAllState(this.ctx.storage);
     this.state = null;
+  }
+
+  private hasAnyConnection(): boolean {
+    return this.ctx.getWebSockets().length > 0;
   }
 
   private async applyCommand(playerId: string, body: CommandBody): Promise<CommandResult> {
