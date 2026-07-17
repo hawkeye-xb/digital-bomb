@@ -33,15 +33,10 @@ export default {
       const objectId = env.ROOMS.idFromName(roomCode);
       const room = env.ROOMS.get(objectId);
 
-      // WebSocket upgrade：转发原始请求（不重建，保留升级属性）
+      // WebSocket upgrade：直接转发原始请求（new Request 会丢失 forbidden Upgrade header）
       const isWs = request.headers.get("Upgrade") === "websocket";
       if (isWs) {
-        // DO 不关心 URL path，但 Upgrade header 必须保留
-        const wsUrl = new URL(request.url);
-        wsUrl.protocol = "https:";
-        wsUrl.hostname = "do";
-        const wsRequest = new Request(wsUrl, request);
-        return room.fetch(wsRequest);
+        return room.fetch(request);
       }
 
       // HTTP 请求：重写 URL 发给 DO
