@@ -610,10 +610,11 @@ function PlayingPhase({
   sendCommand: <T extends string, P>(type: T, payload: P) => void;
 }) {
   const [guessInput, setGuessInput] = useState("");
+  const [showMySecret, setShowMySecret] = useState(false);
   const isMyTurn = game.currentPlayerId === playerId;
 
   const handleGuessChange = (val: string) => {
-    const filtered = val.replace(/\D/g, "").slice(0, 4);
+    const filtered = val.replace(/\\D/g, "").slice(0, 4);
     setGuessInput(filtered);
   };
 
@@ -626,11 +627,24 @@ function PlayingPhase({
   const myTurns = game.turns.filter(t => t.playerId === playerId);
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 12 }}>
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 10 }}>
       <div style={{ textAlign: "center" }}>
         <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
           第 {game.gameNumber} 局 · 第 {myTurns.length + 1} 轮
         </span>
+      </div>
+
+      {/* 我的密码 + 眼睛 */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "4px 0" }}>
+        <span style={{ fontSize: 20, fontWeight: 700, letterSpacing: 4 }}>
+          {showMySecret ? (me?.secret || "****") : "****"}
+        </span>
+        <button
+          style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 6px", background: "var(--surface)", borderRadius: 4, border: "1px solid var(--border)" }}
+          onClick={() => setShowMySecret(!showMySecret)}
+        >
+          {showMySecret ? "隐藏" : "查看密码"}
+        </button>
       </div>
 
       <div style={{ textAlign: "center", fontSize: 16, fontWeight: 600 }}>
@@ -642,7 +656,7 @@ function PlayingPhase({
       </div>
 
       {isMyTurn && (
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, width: "100%", maxWidth: 300, margin: "0 auto" }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, width: "100%", maxWidth: 300, margin: "0 auto" }}>
           <input
             type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4}
             value={guessInput} onChange={(e) => handleGuessChange(e.target.value)}
@@ -732,11 +746,11 @@ function FinishedPhase({
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
       {/* 结果 */}
-      <div style={{ textAlign: "center", padding: "16px 0" }}>
-        <div style={{ fontSize: 24, fontWeight: 700, color: "var(--success)", marginBottom: 8 }}>
-          🎉 {winner?.name || "?"} 赢了！
+      <div style={{ textAlign: "center", padding: "12px 0" }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: "var(--success)", marginBottom: 4 }}>
+          {winner?.name || "?"} 赢了
         </div>
-        <p style={{ fontSize: 14, color: "var(--text-dim)" }}>
+        <p style={{ fontSize: 13, color: "var(--text-dim)", margin: 0 }}>
           我猜了 {myGuesses} 次 · 对手猜了 {oppGuesses} 次
         </p>
       </div>
@@ -754,21 +768,21 @@ function FinishedPhase({
       </div>
 
       {/* 再来一局 */}
-      <div style={{ textAlign: "center" }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
         {!myReady ? (
           <button
             className="btn btn-primary"
-            style={{ maxWidth: 280 }}
+            style={{ minWidth: 200 }}
             onClick={() => sendCommand("rematch.set", { ready: true })}
           >
             再来一局
           </button>
         ) : (
-          <div>
-            <div style={{ color: "var(--success)", marginBottom: 8 }}>✓ 你已准备再来一局</div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+            <div style={{ fontSize: 14, color: "var(--success)" }}>你已准备</div>
             <button
               className="btn btn-secondary"
-              style={{ maxWidth: 280 }}
+              style={{ minWidth: 160 }}
               onClick={() => sendCommand("rematch.set", { ready: false })}
             >
               取消
@@ -776,8 +790,8 @@ function FinishedPhase({
           </div>
         )}
         {opponentReady && (
-          <p style={{ fontSize: 14, color: "var(--text-dim)", marginTop: 8 }}>
-            对方也已准备
+          <p style={{ fontSize: 13, color: "var(--text-dim)", margin: 0 }}>
+            对方也已准备，即将开始…
           </p>
         )}
       </div>
