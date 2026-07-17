@@ -16,8 +16,6 @@ type AppState = {
   name: string;
   roomState: PublicRoomView | null;
   error: string | null;
-  lastCause: PublicCause | null;
-  reconnecting: boolean;
 };
 
 
@@ -105,7 +103,7 @@ export default function App() {
         phase: "home",
       }));
     }
-  }, [state.name, handleMessage]);
+  }, [state.name]);
 
   // ─── 加入房间 ───
 
@@ -161,7 +159,7 @@ export default function App() {
     } catch {
       setState((s) => ({ ...s, error: "加入失败，检查房间码", phase: "home" }));
     }
-  }, [handleMessage]);
+  }, []);
 
   // ─── 发送命令 ───
 
@@ -199,22 +197,6 @@ export default function App() {
 
   // ─── 前台恢复 ───
 
-  useEffect(() => {
-    const onVisible = () => {
-      if (state.reconnecting && transportRef.current) {
-        transportRef.current.connect();
-      }
-    };
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) onVisible();
-    });
-    window.addEventListener("online", onVisible);
-    return () => {
-      document.removeEventListener("visibilitychange", () => {});
-      window.removeEventListener("online", onVisible);
-    };
-  }, [state.reconnecting]);
-
   // ─── 渲染 ───
 
   if (state.phase === "in-room" && state.roomState) {
@@ -225,9 +207,7 @@ export default function App() {
         playerName={state.name}
         sendCommand={sendCommand}
         goHome={goHome}
-        reconnecting={state.reconnecting}
         error={state.error}
-        lastCause={state.lastCause}
         onClearError={() => setState((s) => ({ ...s, error: null }))}
       />
     );
