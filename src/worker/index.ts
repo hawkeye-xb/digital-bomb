@@ -33,10 +33,22 @@ export default {
       const objectId = env.ROOMS.idFromName(roomCode);
       const room = env.ROOMS.get(objectId);
 
-      // WebSocket upgrade：直接转发原始请求（new Request 会丢失 forbidden Upgrade header）
+      // WebSocket upgrade：Upgrade header 会被 Cloudflare DO 内部通信剥离
+      // 用自定义 header 标记 WS 请求
       const isWs = request.headers.get("Upgrade") === "websocket";
       if (isWs) {
-        return room.fetch(request);
+        const wsRequest = new Request(`https://do/api/rooms/${roomCode}/socket`, {
+          method: request.method,
+          headers: {
+            "Content-Type": "application/json",
+            "X-DO-WS-Upgrade": "1",
+          },
+        });
+        // 把 ticket 从 query 传到 body
+        const wsTicket = new URL(request.url).searchParams.get("ticket") || "";
+        const wsBody = JSON.stringify({ ticket: wsTicket });
+        const wsWithBody = new Request(wsRequest, { body: wsBody });
+        return room.fetch(wsWithBody);
       }
 
       // HTTP 请求：重写 URL 发给 DO

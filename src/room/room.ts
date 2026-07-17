@@ -49,8 +49,8 @@ export class Room extends DurableObject<RoomEnv> {
 
     await this.ensureLoaded();
 
-    // 处理 WebSocket 升级
-    if (request.headers.get("Upgrade") === "websocket") {
+    // 处理 WebSocket 升级（自定义 header，因为 Upgrade 在 DO 间通信中被剥离）
+    if (request.headers.get("X-DO-WS-Upgrade") === "1") {
       return this.handleWebSocketUpgrade(request);
     }
 
@@ -190,8 +190,16 @@ export class Room extends DurableObject<RoomEnv> {
       return new Response("房间不存在", { status: 404 });
     }
 
-    const url = new URL(request.url);
-    const ticket = url.searchParams.get("ticket") || "";
+    // ticket 从 body 读取（Worker 已从 query 提取）
+    let ticket = "";
+    try {
+      const body = await request.json() as { ticket?: string };
+      ticket = body.ticket || "";
+    } catch {
+      // fallback: try query
+      const url = new URL(request.url);
+      ticket = url.searchParams.get("ticket") || "";
+    }
 
     // 验证 ticket
     const { verifyTicket } = await import("../worker/auth.js");
