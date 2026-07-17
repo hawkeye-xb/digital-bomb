@@ -169,25 +169,12 @@ export class Room extends DurableObject<RoomEnv> {
   private async handleWsUpgrade(request: Request): Promise<Response> {
     if (!this.state) return this.roomNotFound();
 
-    // 从 URL query 或 body 提取 ticket
-    let ticket = "";
-    const url = new URL(request.url);
-    ticket = url.searchParams.get("ticket") || "";
-    if (!ticket && request.method === "POST") {
-      try { const b = await reqJson(request); ticket = b?.ticket || ""; } catch { /* ignore */ }
-    }
-    if (!ticket) return this.errorRes("TICKET_INVALID", "missing ticket", 401);
+    // Worker 已验证，直接从 body 读取 playerId
+    const b = await reqJson(request);
+    const playerId = b?.playerId as string | undefined;
+    if (!playerId) return this.errorRes("UNAUTHORIZED", "missing playerId", 401);
 
-    // 验证 ticket
-    const { verifyTicket } = await import("../worker/auth.js");
-    const secret = this.env.WS_TICKET_SECRET;
-    if (!secret) return this.errorRes("INTERNAL_ERROR", "missing secret", 500);
-    const claims = await verifyTicket(secret, ticket);
-    if (!claims || claims.roomCode !== this.state.roomCode) {
-      return this.errorRes("TICKET_INVALID", "ticket 无效或已过期", 401);
-    }
-
-    const player = this.state.players.find(p => p.id === claims.playerId);
+    const player = this.state.players.find(p => p.id === playerId);
     if (!player) return this.errorRes("UNAUTHORIZED", "玩家不在房间", 401);
 
     // 创建 WebSocket pair

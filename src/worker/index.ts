@@ -20,17 +20,26 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // WebSocket: 转发 ticket 和 roomCode 给 DO，DO 内部处理 WS 升级
+    // WebSocket: Worker 验证 ticket，传 playerId 给 DO
     const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
     if (wsMatch) {
       const ticket = url.searchParams.get("ticket") || "";
+      const secret = env.WS_TICKET_SECRET;
+      if (!secret) return errorResponse("INTERNAL_ERROR", "missing secret", 500, crypto.randomUUID());
+
+      // Worker 端验证 ticket
+      const claims = await verifyTicket(secret, ticket);
       const roomCode = wsMatch[1]!;
-      // 用 POST 请求传给 DO（避免 CF 剥离 Upgrade header）
+      if (!claims || claims.roomCode !== roomCode) {
+        return errorResponse("TICKET_INVALID", "ticket 无效", 401, crypto.randomUUID());
+      }
+
+      // 直接传 playerId 给 DO（DO 不需要再验证）
       return env.ROOMS.get(env.ROOMS.idFromName(roomCode)).fetch(
         new Request("https://do/socket", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ticket }),
+          body: JSON.stringify({ playerId: claims.playerId }),
         })
       );
     }
