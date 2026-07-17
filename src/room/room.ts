@@ -72,6 +72,7 @@ export class Room extends DurableObject<RoomEnv> {
     const body = await reqJson(request);
     const name = String(body?.name || "").slice(0, 16);
     const tokenHash = String(body?.tokenHash || "");
+    const roomCode = String(body?.roomCode || ""); // 从 Worker 传入房间码
 
     if (!isValidName(name)) {
       return this.errorRes("INVALID_NAME", "昵称 1~16 个可见字符", 400);
@@ -79,8 +80,6 @@ export class Room extends DurableObject<RoomEnv> {
 
     const playerId = crypto.randomUUID();
     const player = createPlayer(playerId, name, tokenHash, 1);
-    // DO name == room code (created via idFromName)
-    const roomCode = this.getRoomCode();
     this.state = initializeRoomState(roomCode, player, Date.now());
     await this.persist();
 

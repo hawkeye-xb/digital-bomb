@@ -322,7 +322,7 @@ async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
       const resp = await fetchDO(env, roomCode, "/init", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, tokenHash }),
+        body: JSON.stringify({ name, tokenHash, roomCode }),
       });
 
       if (resp.ok) {
