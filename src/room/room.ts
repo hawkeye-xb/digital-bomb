@@ -25,14 +25,16 @@ export class Room extends DurableObject<RoomEnv> {
     await this.load();
 
     // WebSocket: path 以 /socket 结尾
+    // Worker 自己处理 WebSocket，DO 只做 HTTP API
     if (path.endsWith("/socket")) {
-      return this.handleWsUpgrade(request);
+      return new Response("use wss via Worker", { status: 400 });
     }
 
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
     if (path.endsWith("/join") && request.method === "POST") return this.handleJoin(request);
     if (path.endsWith("/socket-ticket") && request.method === "POST") return this.handleTicket(request);
     if (path.endsWith("/state") && request.method === "GET") return this.jsonRes({ state: this.state });
+    if (path.endsWith("/command") && request.method === "POST") return this.handleCommand(request);
 
     return this.errorRes("ROOM_NOT_FOUND", "未知操作", 404);
   }
@@ -88,6 +90,60 @@ export class Room extends DurableObject<RoomEnv> {
     const claims = { roomCode: this.state.roomCode, playerId: player.id, expiresAt: Date.now() + 60000, nonce: crypto.randomUUID() };
     const ticketStr = await signTicket(secret, claims);
     return this.jsonRes({ ticket: ticketStr, expiresAt: claims.expiresAt });
+  }
+
+  // ─── Command (Worker→DO HTTP) ───
+
+  private async handleCommand(request: Request): Promise<Response> {
+    if (!this.state) return this.roomNotFound();
+    const b = await reqJson(request);
+    const { type, commandId, expectedVersion, payload, playerId } = b as {
+      type: string; commandId: string; expectedVersion: number;
+      payload: Record<string, unknown>; playerId: string;
+    };
+
+    try {
+      switch (type) {
+        case "ready.set": {
+          const secret = String(payload?.secret || "");
+          if (!isValidGuess(secret)) throw new DomainError("INVALID_SECRET", "密码不是四位数字");
+          const { state } = readySet(this.state, playerId, secret, commandId, Date.now());
+          this.state = state; await this.persist();
+          const cause = state.phase === "playing" && state.currentGame
+            ? { type: "game.started" as const, firstPlayerId: state.currentGame.firstPlayerId }
+            : { type: "ready.changed" as const, playerId, ready: true };
+          return this.jsonRes({ success: true, version: state.version, cause });
+        }
+        case "ready.unset": {
+          const { state } = readyUnset(this.state, playerId, commandId, Date.now());
+          this.state = state; await this.persist();
+          return this.jsonRes({ success: true, version: state.version, cause: { type: "ready.changed" as const, playerId, ready: false } });
+        }
+        case "guess.submit": {
+          const guess = String(payload?.guess || "");
+          if (!isValidGuess(guess)) throw new DomainError("INVALID_GUESS", "猜测不是四位数字");
+          const { state, hitResult } = submitGuess(this.state, playerId, guess, commandId, expectedVersion, Date.now());
+          this.state = state; await this.persist();
+          return this.jsonRes({ success: true, version: state.version, cause: { type: "guess.resolved" as const, playerId, guess, hits: hitResult.hits, won: hitResult.won } });
+        }
+        case "rematch.set": {
+          const ready = Boolean(payload?.ready);
+          const { state } = rematchSet(this.state, playerId, ready, commandId, Date.now());
+          this.state = state; await this.persist();
+          let cause: Record<string, unknown>;
+          if (state.phase === "preparing" && state.completedGames.length > 0 && state.previousLoserId) {
+            cause = { type: "game.reset", firstPlayerId: state.previousLoserId };
+          } else {
+            cause = { type: "rematch.changed", playerId, ready };
+          }
+          return this.jsonRes({ success: true, version: state.version, cause });
+        }
+        default:
+          return this.errorRes("COMMAND_REJECTED", `未知命令: ${type}`, 400);
+      }
+    } catch (e) {
+      return this.domainErrorToJson(e, commandId, this.state?.version || 0);
+    }
   }
 
   // ─── WebSocket Upgrade ───
