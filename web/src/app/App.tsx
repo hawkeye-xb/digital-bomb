@@ -45,7 +45,9 @@ function saveStorage(roomCode: string, token: string, name: string) {
 }
 
 function inviteCodeFromPath(): string {
-  return location.pathname.match(/^\/r\/([A-HJ-NP-Z2-9]{6})$/i)?.[1]?.toUpperCase() || "";
+  // Tolerate legacy share text pasted after the URL, e.g.
+  // /r/ABC234%20来玩数字炸弹...; reject a genuine 7-character code.
+  return location.pathname.match(/^\/r\/([A-HJ-NP-Z2-9]{6})(?:$|[^A-HJ-NP-Z2-9])/i)?.[1]?.toUpperCase() || "";
 }
 
 function isValidClientName(name: string): boolean {
@@ -296,6 +298,13 @@ export default function App() {
   }, []);
 
   // ─── 从 URL 检测房间码 ───
+
+  useEffect(() => {
+    const inviteCode = inviteCodeFromPath();
+    if (inviteCode && location.pathname !== `/r/${inviteCode}`) {
+      history.replaceState(null, "", `/r/${inviteCode}`);
+    }
+  }, []);
 
   useEffect(() => {
     if (state.phase !== "invite" || !state.roomCode) return;
@@ -568,7 +577,9 @@ function RoomScreen({
     const url = `${location.origin}/r/${roomState.roomCode}`;
     if (navigator.share) {
       try {
-        await navigator.share({ title: "数字炸弹", text: `来玩数字炸弹！房间码: ${roomState.roomCode}`, url });
+        // Some share targets concatenate `text` and `url` into one string.
+        // A single URL stays clickable and cannot pollute the route.
+        await navigator.share({ title: "数字炸弹", url });
         return;
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
