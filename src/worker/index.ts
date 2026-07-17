@@ -20,11 +20,17 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // WebSocket: 转发原始 request 给 DO
+    // WebSocket: 从 URL 提取 ticket，转为 POST body 发给 DO
     const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
     if (wsMatch) {
-      const room = env.ROOMS.get(env.ROOMS.idFromName(wsMatch[1]!));
-      return room.fetch(request);
+      const ticket = url.searchParams.get("ticket") || "";
+      const roomCode = wsMatch[1]!;
+      const doReq = new Request(`https://do/ws-upgrade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticket, roomCode }),
+      });
+      return env.ROOMS.get(env.ROOMS.idFromName(roomCode)).fetch(doReq);
     }
 
     if (path === "/api/rooms" && method === "POST") {

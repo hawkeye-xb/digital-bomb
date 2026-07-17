@@ -24,10 +24,7 @@ export class Room extends DurableObject<RoomEnv> {
     const path = url.pathname;
     await this.load();
 
-    // 调试：看 DO 收到什么 path
-    if (path.startsWith("/api/rooms/") && path.endsWith("/socket")) {
-      return new Response(`DEBUG: path=${path} url=${request.url}`, { status: 200 });
-    }
+    if (path.endsWith("/ws-upgrade") && request.method === "POST") return this.handleWsUpgrade(request);
 
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
     if (path.endsWith("/join") && request.method === "POST") return this.handleJoin(request);
