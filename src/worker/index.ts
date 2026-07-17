@@ -53,53 +53,47 @@ export default {
 };
 
 async function handleWebSocket(request: Request, env: Env, roomCode: string): Promise<Response> {
+  // Verify ticket
   const ticket = new URL(request.url).searchParams.get("ticket") || "";
   const secret = env.WS_TICKET_SECRET;
   if (!secret) return new Response("no secret", { status: 500 });
-
   const claims = await verifyTicket(secret, ticket);
   if (!claims || claims.roomCode !== roomCode)
     return new Response(`invalid ticket. claims_room=${claims?.roomCode} vs ${roomCode}`, { status: 401 });
 
-  // Forbidden header workaround: copy necessary WebSocket headers
-  const k = request.headers.get("Sec-WebSocket-Key") || "";
-  const v = request.headers.get("Sec-WebSocket-Version") || "";
-
-  // 1. Create pair
+  // Create WebSocket pair
   const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
+  const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
 
-  // 2. Set up server
-  (server as WebSocket).accept();
-  connections.set(server as WebSocket, { ws: server as WebSocket, playerId: claims.playerId, roomCode });
+  server.accept();
+  connections.set(server, { ws: server, playerId: claims.playerId, roomCode });
 
-  // 3. Send initial snapshot
-  try {
-    const st = await getRoomState(env, roomCode);
-    if (st) sendSnapshot(server as WebSocket, st, claims.playerId, roomCode);
-  } catch (e) { console.error(e); }
-
-  // 4. Handle messages
-  (server as WebSocket).addEventListener("message", async (e: Event) => {
+  // Set up message handler
+  server.addEventListener("message", async (event: Event) => {
     try {
-      const msg = JSON.parse((e as MessageEvent).data);
-      await handleWsMsg(server as WebSocket, msg, env);
-    } catch (err) { console.error(err); }
+      const msg = JSON.parse((event as MessageEvent).data as string);
+      await handleWsMsg(server, msg, env);
+    } catch (e) { console.error(e); }
   });
 
-  // 5. Handle close
-  (server as WebSocket).addEventListener("close", () => {
-    connections.delete(server as WebSocket);
+  server.addEventListener("close", () => {
+    connections.delete(server);
   });
 
-  // 6. Build 101 response manually
-  const respHeaders = new Headers();
-  respHeaders.set("Upgrade", "websocket");
-  respHeaders.set("Connection", "Upgrade");
-  const acceptKey = btoa(hexToBase64(await sha1(k + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
-  respHeaders.set("Sec-WebSocket-Accept", acceptKey);
+  // Compute WebSocket accept key
+  const wsKey = request.headers.get("Sec-WebSocket-Key") || "";
+  const acceptInput = wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  const hash = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(acceptInput));
+  const acceptKey = btoa(String.fromCharCode(...new Uint8Array(hash)));
 
-  return new Response(null, { status: 101, headers: respHeaders, webSocket: client as never });
+  return new Response(null, {
+    status: 101,
+    headers: {
+      "Upgrade": "websocket",
+      "Connection": "Upgrade",
+      "Sec-WebSocket-Accept": acceptKey,
+    },
+  });
 }
 
 async function handleWsMsg(ws: WebSocket, raw: { type: string; commandId: string; expectedVersion: number; payload: unknown }, env: Env) {
