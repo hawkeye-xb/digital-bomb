@@ -34,9 +34,11 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // WebSocket upgrade：Worker 直接处理
-    if (request.headers.get("Upgrade") === "websocket") {
-      return handleWebSocket(request, env);
+    // WebSocket upgrade：/api/rooms/{code}/socket 路径判断
+    // ⚠️ Cloudflare edge strips Upgrade header before reaching Worker
+    const wsMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
+    if (wsMatch) {
+      return handleWebSocket(request, env, wsMatch[1]!);
     }
 
     // POST /api/rooms → 创建房间
@@ -71,17 +73,9 @@ export default {
 
 // ─── WebSocket 处理 ───
 
-async function handleWebSocket(request: Request, env: Env): Promise<Response> {
+async function handleWebSocket(request: Request, env: Env, roomCode: string): Promise<Response> {
   const url = new URL(request.url);
-  const path = url.pathname;
   const ticket = url.searchParams.get("ticket") || "";
-  const roomMatch = path.match(/^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/);
-
-  if (!roomMatch) {
-    return new Response("invalid ws path", { status: 404 });
-  }
-
-  const roomCode = roomMatch[1]!;
 
   // 验证 ticket
   const secret = env.WS_TICKET_SECRET || "dev-secret";
