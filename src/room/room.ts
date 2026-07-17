@@ -240,6 +240,11 @@ export class Room extends DurableObject<RoomEnv> {
           state: this.publicView(attachment.playerId),
         } satisfies ServerMessage));
       }
+      socket.send(JSON.stringify({
+        type: "command.ack",
+        commandId: (message as CommandBody).commandId,
+        version: this.state.version,
+      } satisfies ServerMessage));
     } catch (error) {
       const domain = error instanceof DomainError
         ? error

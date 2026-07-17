@@ -84,6 +84,12 @@ export type CommandError = {
   currentVersion: number;
 };
 
+export type CommandAck = {
+  type: "command.ack";
+  commandId: string;
+  version: number;
+};
+
 export type PresenceUpdated = {
   type: "presence.updated";
   playerId: string;
@@ -102,6 +108,7 @@ export type ServerMessage =
   | RoomSnapshot
   | RoomUpdated
   | RoomExpired
+  | CommandAck
   | CommandError
   | PresenceUpdated
   | InteractionReceived;

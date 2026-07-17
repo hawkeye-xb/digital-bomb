@@ -74,12 +74,14 @@ async function connect(roomCode, token) {
 }
 
 function sendCommand(client, type, payload, version) {
+  const commandId = crypto.randomUUID();
   client.socket.send(JSON.stringify({
     type,
     payload,
     expectedVersion: version,
-    commandId: crypto.randomUUID(),
+    commandId,
   }));
+  return commandId;
 }
 
 async function hashToken(token) {
@@ -127,9 +129,14 @@ try {
   );
   assert.equal(presence.connected, true);
 
-  sendCommand(alice, "ready.set", { secret: "1234" }, alice.state.version);
+  const readyCommandId = sendCommand(alice, "ready.set", { secret: "1234" }, alice.state.version);
   await nextState(alice, "ready.changed");
   await nextState(bob, "ready.changed");
+  const readyAck = await alice.inbox.next(
+    (message) => message.type === "command.ack" && message.commandId === readyCommandId,
+    "ready command ack",
+  );
+  assert.equal(readyAck.version, alice.state.version);
 
   sendCommand(bob, "ready.set", { secret: "5678" }, bob.state.version);
   await nextState(alice, "game.started");

@@ -590,7 +590,7 @@ function RoomScreen({
   };
 
   return (
-    <div className="container">
+    <div className={`container room-container${phase === "playing" ? " playing-room" : ""}`}>
       {/* 连接状态 */}
       {connection !== "connected" && (
         <div className="connection-bar reconnecting">
@@ -822,6 +822,7 @@ function PlayingPhase({
   const [guessInput, setGuessInput] = useState("");
   const [showMySecret, setShowMySecret] = useState(false);
   const guessInputRef = useRef<HTMLInputElement | null>(null);
+  const historyRef = useRef<HTMLDivElement | null>(null);
   const isMyTurn = game.currentPlayerId === playerId;
   const turnStartedAt = game.turns.at(-1)?.createdAt ?? game.startedAt;
   const elapsed = useElapsedSeconds(turnStartedAt);
@@ -856,8 +857,13 @@ function PlayingPhase({
   const rounds = groupTurnsIntoRounds(allTurns);
   const currentRound = Math.floor(allTurns.length / 2) + 1;
 
+  useEffect(() => {
+    // New guesses are pushed onto the visual stack, so keep its top visible.
+    historyRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [allTurns.length]);
+
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 10 }}>
+    <div className="playing-phase">
       <div style={{ textAlign: "center" }}>
         <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
           第 {game.gameNumber} 局 · 第 {currentRound} 轮
@@ -914,13 +920,13 @@ function PlayingPhase({
       )}
 
       {/* 双方历史 */}
-      <div className="history-panel">
+      <div ref={historyRef} className="history-panel">
         {rounds.length > 0 ? (
           <div className="turn-history">
             {[...rounds].reverse().map((round) => (
               <div key={round.ro} className="round-group">
                 <div className="round-label">第 {round.ro} 轮</div>
-                {round.turns.map((t) => {
+                {stackRoundTurns(round.turns).map((t) => {
                   const p = t.playerId === me?.id ? me : opponent;
                   return (
                     <div key={t.turnNumber} className="turn-row">
@@ -960,6 +966,10 @@ function groupTurnsIntoRounds(
     ro++;
   }
   return results;
+}
+
+export function stackRoundTurns<T>(turns: readonly T[]): T[] {
+  return [...turns].reverse();
 }
 
 function hitsText(hits: number): string {
