@@ -1,9 +1,10 @@
 // ─── 主应用 ───
 
 import React, { useState, useCallback, useEffect, useRef } from "react";
-import type { PublicRoomView, PublicPlayer, PublicCause } from "../../../src/shared/domain.js";
-import type { ServerMessage } from "../../../src/shared/protocol.js";
-import { GameTransport } from "../transport/websocket.js";
+import type { PublicRoomView, PublicPlayer, PublicCause, PublicGame } from "../../../src/shared/domain.js";
+import { GameTransport } from "../transport/http.js";
+
+const API = "/api";
 
 type AppPhase = "home" | "creating" | "joining" | "in-room";
 
@@ -19,7 +20,6 @@ type AppState = {
   reconnecting: boolean;
 };
 
-const API = "/api";
 
 // ─── 从 localStorage 恢复 ───
 
@@ -46,48 +46,13 @@ export default function App() {
     name: loadStorage()["_lastName"]?.name || "",
     roomState: null,
     error: null,
-    lastCause: null,
-    reconnecting: false,
   });
 
   const transportRef = useRef<GameTransport | null>(null);
 
   // ─── 处理服务端消息 ───
 
-  const handleMessage = useCallback((msg: ServerMessage) => {
-    switch (msg.type) {
-      case "room.snapshot":
-        setState((s) => ({
-          ...s,
-          roomState: msg.state,
-          reconnecting: false,
-          phase: "in-room",
-        }));
-        break;
-      case "room.updated":
-        setState((s) => ({
-          ...s,
-          roomState: msg.state,
-          lastCause: msg.cause,
-          reconnecting: false,
-        }));
-        break;
-      case "room.expired":
-        setState((s) => ({
-          ...s,
-          phase: "home",
-          roomState: null,
-          error: "房间已过期",
-        }));
-        break;
-      case "command.error":
-        setState((s) => ({
-          ...s,
-          error: msg.message,
-        }));
-        break;
-    }
-  }, []);
+
 
   // ─── 创建房间 ───
 
@@ -117,12 +82,9 @@ export default function App() {
       saveStorage(data.roomCode, data.playerToken, name);
       saveStorage("_lastName", "", name);
 
-      const t = new GameTransport(location.origin, data.roomCode, data.playerToken, {
-        onSnapshot: (msg) => handleMessage(msg),
-        onUpdated: (msg) => handleMessage(msg),
-        onExpired: () => handleMessage({ type: "room.expired" }),
-        onError: (msg) => handleMessage(msg),
-        onClose: () => setState((s) => ({ ...s, reconnecting: true })),
+      const t = new GameTransport(data.roomCode, data.playerToken, {
+        onState: (s) => setState((prev) => ({ ...prev, roomState: s, phase: "in-room" })),
+        onError: (code, msg) => setState((prev) => ({ ...prev, error: msg })),
       });
 
       transportRef.current = t;
@@ -178,12 +140,9 @@ export default function App() {
       saveStorage(code, finalToken, name);
       saveStorage("_lastName", "", name);
 
-      const t = new GameTransport(location.origin, code, finalToken, {
-        onSnapshot: (msg) => handleMessage(msg),
-        onUpdated: (msg) => handleMessage(msg),
-        onExpired: () => handleMessage({ type: "room.expired" }),
-        onError: (msg) => handleMessage(msg),
-        onClose: () => setState((s) => ({ ...s, reconnecting: true })),
+      const t = new GameTransport(code, finalToken, {
+        onState: (s) => setState((prev) => ({ ...prev, roomState: s, phase: "in-room" })),
+        onError: (code, msg) => setState((prev) => ({ ...prev, error: msg })),
       });
 
       transportRef.current = t;
@@ -209,12 +168,7 @@ export default function App() {
   const sendCommand = useCallback(
     <T extends string, P>(type: T, payload: P) => {
       if (!state.roomState) return;
-      transportRef.current?.send({
-        type,
-        commandId: crypto.randomUUID(),
-        expectedVersion: state.roomState.version,
-        payload,
-      });
+      transportRef.current?.sendCommand(type, payload, state.roomState.version);
     },
     [state.roomState],
   );
