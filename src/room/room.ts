@@ -31,7 +31,19 @@ export class Room extends DurableObject<RoomEnv> {
     if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
     if (path.endsWith("/join") && request.method === "POST") return this.handleJoin(request);
     if (path.endsWith("/socket-ticket") && request.method === "POST") return this.handleTicket(request);
-    if (path.endsWith("/state") && request.method === "GET") return this.jsonRes({ state: this.state });
+    if (path.endsWith("/state") && request.method === "GET") {
+      // 通过 Authorization header 识别玩家，返回脱敏视图
+      const auth = request.headers.get("Authorization") || "";
+      const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+      let viewerId: string | null = null;
+      if (token && this.state) {
+        const { hashToken } = await import("../worker/auth.js");
+        const th = await hashToken(token);
+        const player = this.state.players.find(p => p.tokenHash === th);
+        viewerId = player?.id || null;
+      }
+      return this.jsonRes({ state: this.publicView(viewerId) });
+    }
     if (path.endsWith("/command") && request.method === "POST") return this.handleCommand(request);
 
     return this.errorRes("ROOM_NOT_FOUND", "未知操作", 404);
@@ -94,10 +106,20 @@ export class Room extends DurableObject<RoomEnv> {
 
   private async handleCommand(request: Request): Promise<Response> {
     if (!this.state) return this.roomNotFound();
+    // 从 Authorization header 识别玩家
+    const auth = request.headers.get("Authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (!token) return this.errorRes("UNAUTHORIZED", "缺少凭证", 401);
+    const { hashToken } = await import("../worker/auth.js");
+    const th = await hashToken(token);
+    const player = this.state.players.find(p => p.tokenHash === th);
+    if (!player) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
+    const playerId = player.id;
+
     const b = await reqJson(request);
-    const { type, commandId, expectedVersion, payload, playerId } = b as {
+    const { type, commandId, expectedVersion, payload } = b as {
       type: string; commandId: string; expectedVersion: number;
-      payload: Record<string, unknown>; playerId: string;
+      payload: Record<string, unknown>;
     };
 
     try {
