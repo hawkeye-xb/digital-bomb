@@ -26,6 +26,7 @@ import {
 } from "./engine.js";
 import { toPublicRoomView } from "./public-view.js";
 import { deleteAllState, loadState, saveState } from "./storage.js";
+import { generatePlayerToken, hashToken, signTicket } from "../worker/auth.js";
 
 type SocketAttachment = {
   playerId: string;
@@ -44,22 +45,33 @@ export interface RoomEnv {
   WS_TICKET_SECRET: string;
 }
 
+// Worker 对 WS 请求原样转发（/api/rooms/:code/socket），其余 API 改写为 /:action。
+// 这里做精确匹配，避免 /foo/state 之类拼接路径误命中。
+const WS_PATH_RE = /^\/api\/rooms\/[A-HJ-NP-Z2-9]{6}\/socket$/;
+const KNOWN_ACTIONS = new Set(["init", "join", "socket-ticket", "state", "command"]);
+
+function resolveAction(path: string): string {
+  if (WS_PATH_RE.test(path)) return "socket";
+  const action = path.replace(/^\//, "");
+  return KNOWN_ACTIONS.has(action) ? action : "";
+}
+
 export class Room extends DurableObject<RoomEnv> {
   private state: RoomState | null = null;
   private loaded = false;
 
   async fetch(request: Request): Promise<Response> {
     await this.load();
-    const path = new URL(request.url).pathname;
+    const action = resolveAction(new URL(request.url).pathname);
 
-    if (path.endsWith("/socket") && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    if (action === "socket" && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       return this.handleWsUpgrade(request);
     }
-    if (path.endsWith("/init") && request.method === "POST") return this.handleInit(request);
-    if (path.endsWith("/join") && request.method === "POST") return this.handleJoin(request);
-    if (path.endsWith("/socket-ticket") && request.method === "POST") return this.handleTicket(request);
-    if (path.endsWith("/state") && request.method === "GET") return this.handleState(request);
-    if (path.endsWith("/command") && request.method === "POST") return this.handleHttpCommand(request);
+    if (action === "init" && request.method === "POST") return this.handleInit(request);
+    if (action === "join" && request.method === "POST") return this.handleJoin(request);
+    if (action === "socket-ticket" && request.method === "POST") return this.handleTicket(request);
+    if (action === "state" && request.method === "GET") return this.handleState(request);
+    if (action === "command" && request.method === "POST") return this.handleHttpCommand(request);
 
     return this.errorRes("ROOM_NOT_FOUND", "未知操作", 404);
   }
@@ -87,6 +99,16 @@ export class Room extends DurableObject<RoomEnv> {
 
     const existing = this.state.players.find((p) => p.tokenHash === tokenHash);
     if (existing) {
+      // 老玩家改昵称后重进：落库新昵称，否则新名字会被静默丢弃
+      if (existing.name !== name) {
+        this.state = {
+          ...this.state,
+          players: this.state.players.map((p) => (p.id === existing.id ? { ...p, name } : p)),
+          lastActivityAt: Date.now(),
+        };
+        await this.persist();
+        this.broadcastState({ type: "player.joined", playerId: existing.id });
+      }
       return this.jsonRes({
         playerId: existing.id,
         playerToken: "",
@@ -95,7 +117,6 @@ export class Room extends DurableObject<RoomEnv> {
     }
     if (this.state.players.length >= 2) return this.errorRes("ROOM_FULL", "房间已满", 409);
 
-    const { generatePlayerToken, hashToken } = await import("../worker/auth.js");
     const playerId = crypto.randomUUID();
     const token = generatePlayerToken();
     const player = createPlayer(playerId, name, await hashToken(token), 2);
@@ -118,7 +139,6 @@ export class Room extends DurableObject<RoomEnv> {
     if (!player || !this.state) return this.errorRes("UNAUTHORIZED", "凭证无效", 401);
     if (!this.env.WS_TICKET_SECRET) return this.errorRes("INTERNAL_ERROR", "服务未配置", 500);
 
-    const { signTicket } = await import("../worker/auth.js");
     const claims = {
       roomCode: this.state.roomCode,
       playerId: player.id,
@@ -271,7 +291,7 @@ export class Room extends DurableObject<RoomEnv> {
     });
     this.broadcastPresence(attachment.playerId, stillConnected, "idle");
 
-    // 双方都断连 → 设 5 分钟清理 alarm
+    // 双方都断连 → 设 5 分钟检查点 alarm（仅检查，不会在到期前清房）
     if (this.state && !this.hasAnyConnection()) {
       const cleanupAt = Date.now() + 5 * 60 * 1000;
       await this.ctx.storage.setAlarm(cleanupAt);
@@ -286,21 +306,13 @@ export class Room extends DurableObject<RoomEnv> {
     await this.load();
     if (!this.state) return;
 
-    // 双方断连超时清理：alarm 触发时仍无连接 → 直接清房
-    if (!this.hasAnyConnection()) {
-      for (const socket of this.ctx.getWebSockets()) {
-        try { socket.close(4002, "cleanup"); } catch { /* already closed */ }
-      }
-      await deleteAllState(this.ctx.storage);
-      this.state = null;
-      return;
-    }
-
-    // 有人重连了 → 恢复正常过期
+    // 未到期一律不清房：可能只是双方暂时断连触发的 5 分钟检查点。
+    // 直接把 alarm 改排到真正的到期时间，避免误删活跃房间。
     if (!isExpired(this.state, Date.now())) {
       await this.ctx.storage.setAlarm(this.state.expiresAt);
       return;
     }
+
     for (const socket of this.ctx.getWebSockets()) {
       try {
         socket.send(JSON.stringify({ type: "room.expired" } satisfies ServerMessage));
@@ -424,7 +436,6 @@ export class Room extends DurableObject<RoomEnv> {
     const auth = request.headers.get("Authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (!token) return null;
-    const { hashToken } = await import("../worker/auth.js");
     const tokenHash = await hashToken(token);
     return this.state.players.find((player) => player.tokenHash === tokenHash) ?? null;
   }
