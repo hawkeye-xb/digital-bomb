@@ -599,18 +599,23 @@ function RoomScreen({
 
   const shareRoom = async () => {
     const url = `${location.origin}/r/${roomState.roomCode}`;
-    if (navigator.share) {
+    // 优先用系统分享（微信等不支持时 fallback）
+    if (typeof navigator !== "undefined" && navigator.share) {
       try {
-        // Some share targets concatenate `text` and `url` into one string.
-        // A single URL stays clickable and cannot pollute the route.
         await navigator.share({ title: "数字炸弹", url });
         return;
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
       }
     }
-    await navigator.clipboard.writeText(url).catch(() => {});
-    showToast("邀请链接已复制");
+    // Fallback: 复制链接 + 显示 toast 让用户看到内容
+    const copied = await navigator.clipboard.writeText(url).then(() => true).catch(() => false);
+    if (copied) {
+      showToast("邀请链接已复制，发给朋友即可加入");
+    } else {
+      // 最后的 fallback：弹窗显示链接让用户手动复制
+      prompt("复制这个链接发给朋友：", url);
+    }
   };
 
   return (
@@ -715,6 +720,11 @@ function RoomScreen({
 // ─── 等待阶段 ───
 
 function WaitingPhase({ roomCode, onShare, onCopy }: { roomCode: string; onShare: () => void; onCopy?: () => void }) {
+  const inviteUrl = typeof location !== "undefined" ? `${location.origin}/r/${roomCode}` : "";
+  const copyUrl = () => {
+    navigator.clipboard.writeText(inviteUrl).then(() => onCopy?.()).catch(() => {});
+  };
+
   return (
     <div style={{ textAlign: "center", padding: "12px 0" }}>
       <p style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 8 }}>房间码</p>
@@ -727,9 +737,37 @@ function WaitingPhase({ roomCode, onShare, onCopy }: { roomCode: string; onShare
           复制
         </button>
       </div>
-      <p style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 10 }}>把这串码发给朋友</p>
-      <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={onShare}>
-        分享邀请链接
+
+      <div className="card" style={{ marginTop: 16, padding: "12px 16px", textAlign: "left" }}>
+        <p style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 6 }}>邀请链接</p>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <code style={{
+            flex: 1,
+            fontSize: 13,
+            color: "var(--accent-1)",
+            background: "var(--bg)",
+            padding: "8px 12px",
+            borderRadius: "var(--radius)",
+            wordBreak: "break-all",
+            userSelect: "all",
+          }}>
+            {inviteUrl}
+          </code>
+          <button
+            className="btn btn-primary"
+            style={{ width: "auto", padding: "8px 16px", fontSize: 14, whiteSpace: "nowrap" }}
+            onClick={copyUrl}
+          >
+            复制链接
+          </button>
+        </div>
+        <p style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 8, marginBottom: 0 }}>
+          发给朋友，打开链接即可加入
+        </p>
+      </div>
+
+      <button className="btn btn-secondary" style={{ marginTop: 12 }} onClick={onShare}>
+        📤 系统分享
       </button>
     </div>
   );
