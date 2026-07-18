@@ -176,6 +176,9 @@ export function readyUnset(
   const player = state.players.find((p) => p.id === playerId);
   if (!player) throw new DomainError("UNAUTHORIZED", "玩家不存在");
 
+  // 未准备时取消是无操作：直接返回原状态，避免无意义的 version 递增和广播
+  if (!player.ready) return { state };
+
   const newPlayers = state.players.map((p) =>
     p.id === playerId ? { ...p, ready: false, secret: null } : p,
   );
