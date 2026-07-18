@@ -1227,13 +1227,19 @@ function PlayerSeat({
 // ─── Toast ───
 
 function Toast({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  // 调用方传入的往往是内联闭包，每次渲染都是新引用；若直接作为 effect
+  // 依赖，高频 re-render（如每秒的计时 tick）会不断重置计时器，导致 Toast
+  // 永不消失。用 ref 固定最新回调，计时器只随 message 变化重置。
+  const dismissRef = useRef(onDismiss);
+  dismissRef.current = onDismiss;
+
   useEffect(() => {
-    const t = setTimeout(onDismiss, 3000);
+    const t = setTimeout(() => dismissRef.current(), 3000);
     return () => clearTimeout(t);
-  }, [message, onDismiss]);
+  }, [message]);
 
   return (
-    <div className="toast" onClick={onDismiss}>
+    <div className="toast" onClick={() => dismissRef.current()}>
       {message}
     </div>
   );
